@@ -1,0 +1,20 @@
+# Financial data and secrets never go to GitHub (ADR 0002). Code only.
+data/
+backups/
+*.db
+*.db-journal
+*.lock
+*.xlsx
+*.xls
+*.csv
+*.pdf
+config.json
+.env
+*token*
+!scripts/make_token.py
+
+__pycache__/
+*.pyc
+.claude/
+desktop.ini
+Example/
