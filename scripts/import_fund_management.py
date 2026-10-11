@@ -23,7 +23,7 @@ import db  # noqa: E402
 QUARTER_END = {1: "03-31", 2: "06-30", 3: "09-30", 4: "12-31"}
 FLOW_ACCOUNTS = {"Stock": "Stocks", "Trading": "OKX Trading"}
 GOAL_COLUMNS = {"OnTheWall": (8, None), "Stock": (10, "investment"), "Trading": (12, "trading"),
-                "Saving": (14, "wealth"), "EMC": (16, "wealth")}
+                "Saving Bitcoin": (14, "wealth"), "Saving Cash": (16, "wealth")}      # the sheet's Saving and EMC columns, named as the dashboard shows them
 
 
 def num(v):

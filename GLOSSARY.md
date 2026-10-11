@@ -7,15 +7,15 @@ One place where Best sees his portfolio, shops, cash flow, plans and assets, wit
 ### Buckets and accounts
 
 **Bucket**:
-One of the three purposes Best holds money for: Investment, Trading or Wealth. Every Account belongs to exactly one.
+One of the three purposes Best holds money for: Stock, Trading or Wealth (the Bucket stored as `investment`; the dashboard calls it Stock since 2026-10-11). Every Account belongs to exactly one.
 _Avoid_: asset class, category, portfolio
 
 **Account**:
 One place where money sits and is valued as a single figure, such as a brokerage account, an OKX sub-account or a Wealth Card.
 _Avoid_: portfolio, wallet, port
 
-**Investment**:
-The Bucket of stock Accounts held for the long term.
+**Stock**:
+The Bucket of stock Accounts held for the long term, shown as Stock and Stock Portfolio (stored as `investment`).
 
 **Trading**:
 The Bucket of Accounts traded under a Setup from the trading plan, including the bot Account.
@@ -34,7 +34,7 @@ Whether an Account's value is included in Total Portfolio Value. A Display-only 
 Best's emergency cash.
 
 **Allocation Group**:
-One of the four parts Asset Allocation is shown in: Investment, Trading, Saving or EMC. Every Counted Account falls in exactly one; a Wealth Card is either Saving or EMC.
+One of the four parts Asset Allocation is shown in: Stock, Trading, Saving or EMC. Every Counted Account falls in exactly one; a Wealth Card is either Saving or EMC.
 _Avoid_: asset class, Bucket
 
 ### Figures

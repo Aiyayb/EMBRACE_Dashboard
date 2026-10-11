@@ -279,6 +279,95 @@ class MetricsTest(unittest.TestCase):
         self.assertAlmostEqual(k["shop_mom"], 0.5)
         self.assertAlmostEqual(k["investment_mom"], 0.05)
 
+    def test_plan_measures_this_years_goals_and_keeps_income_targets_out_of_the_total(self):
+        self.snap("Stocks", "2029-12-31", 1000)
+        self.snap("Stocks", "2030-06-30", 1600)
+        self.flow("Stocks", "2030-03-01", 300)
+        self.flow("Stocks", "2030-07-01", 999)                                   # after the latest month: not counted yet
+        goal = "INSERT INTO goals(year, name, bucket, goal_thb, monthly_thb, growth_pct, note) VALUES (?,?,?,?,?,?,?)"
+        self.conn.execute(goal, (2030, "Stock", "investment", 2000, 100, 0.15, "plan"))
+        self.conn.execute(goal, (2030, "OnTheWall", None, 500, None, None, None))
+        self.conn.execute(goal, (2032, "Stock", "investment", 5000, None, None, None))
+        db.set_setting(self.conn, "plan_birth_year", "1991")
+        plan = metrics.plan_view(self.conn, metrics.monthly(self.conn), {"OnTheWall": {2030: 120}})
+        t = plan["this_year"]
+        self.assertEqual((t["year"], t["month"], t["months_left"], t["target_thb"], t["actual_thb"]), (2030, "2030-06", 6, 2000, 1600))   # the 500 of income is not in it
+        self.assertEqual((t["opening_thb"], t["expected_thb"], t["gap_thb"], t["per_month_thb"]), (1000, 1500, 400, 66.67))
+        stock = next(i for i in t["items"] if i["name"] == "Stock")
+        self.assertEqual((stock["actual_thb"], stock["deposits_ytd"], stock["deposits_plan_ytd"], stock["growth_pct"], stock["note"]), (1600, 300, 600, 0.15, "plan"))
+        shop = next(i for i in t["items"] if i["name"] == "OnTheWall")
+        self.assertEqual((shop["group"], shop["actual_thb"], shop["deposits_ytd"]), (None, 120, None))
+        big = plan["big"]
+        self.assertEqual((big["year"], big["age"], big["target_thb"], big["months_left"]), (2032, 41, 5000, 30))
+        self.assertAlmostEqual(big["needed_growth"], (5000 / 1600) ** (12 / 30) - 1)
+        self.assertEqual([(r["year"], r["target_thb"], r["income_thb"], r["actual_thb"]) for r in plan["roadmap"]], [(2030, 2000, 500, 1600), (2032, 5000, 0, None)])
+        self.assertEqual(plan["history"], [{"year": 2029, "actual_thb": 1000}])
+
+    def test_finance_flow_averages_the_log_and_measures_investment_against_spending(self):
+        self.snap("Stocks", "2030-02-28", 600000)
+        self.snap("OKX Trading", "2030-02-28", 60000)
+        line = "INSERT INTO cashflow_lines(month, section, line, amount_thb, entered_by, created_at) VALUES (?,?,?,?,'test','now')"
+        for month in ("2030-01", "2030-02"):
+            for row in (("income", "Salary", 100000), ("income", "Stock dividend", 1000), ("income", "Online Shop", 2000),
+                        ("fixed_cost", "House debt", 40000), ("expense", "Food", 10000), ("allocation", "Stock", 20000), ("allocation", "Saving Bitcoin", 5000)):
+                self.conn.execute(line, (month, *row))
+        self.conn.execute(line, ("2030-03", "expense", "Later", 999999))          # after the latest finished month: not in the average
+        road = [{"year": 2030, "age": 39, "plan": {"investment": 1000000, "trading": 0}}, {"year": 2031, "age": 40, "plan": {"investment": 4000000, "trading": 0}}]
+        f = metrics.finance_flow(self.conn, metrics.monthly(self.conn), {"stock": 0.15, "trading": 0.5}, road)
+        self.assertEqual((f["months"], f["income"], f["income_thb"]), (2, {"salary": 100000, "investment": 1000, "shop": 2000, "other": 0}, 103000))
+        self.assertEqual((f["spending"], f["spending_thb"], f["reinvest_thb"], f["saved_thb"], f["free_thb"]), ({"fixed": 40000, "debt": 0, "expense": 10000}, 50000, 20000, 5000, 28000))
+        self.assertEqual(f["investment"], {"stock": 600000, "trading": 60000, "total": 660000})
+        self.assertEqual(f["expected_return_thb"], 10000)                        # (600,000 x 15% + 60,000 x 50%) / 12, a planning figure
+        self.assertEqual((f["goes_on_thb"], f["gap_thb"]), (2000, 48000))        # Online Shop goes on without the job, so Investment has less to pay
+        self.assertAlmostEqual(f["coverage"], 10000 / 48000)
+        self.assertAlmostEqual(f["actual_coverage"], 0.02)                       # what was really recorded as income from Investment
+        self.assertEqual(f["needed_thb"], 3168000)                               # 576,000 a year to pay at the 18.18% the mix returns
+        self.assertEqual([(p["year"], p["return_thb"]) for p in f["path"]], [(2030, 12500), (2031, 50000)])
+        self.assertEqual((f["covered_year"], f["covered_age"]), (2031, 40))
+
+    def test_finance_flow_is_one_model_of_income_spending_debt_and_yields(self):
+        self.snap("Stocks", "2030-02-28", 600000)
+        self.snap("OKX Trading", "2030-02-28", 0)
+        line = "INSERT INTO cashflow_lines(month, section, line, amount_thb, entered_by, created_at) VALUES (?,?,?,?,'test','now')"
+        for row in (("income", "Salary", 100000), ("fixed_cost", "House debt", 40000), ("fixed_cost", "Utility", 5000), ("expense", "Food", 15000), ("allocation", "Stock", 10000)):
+            self.conn.execute(line, ("2030-02", *row))
+        rows, y = metrics.monthly(self.conn), {"stock": 0.12, "trading": 0.5}
+        debt = [{"name": "House", "line": "House debt", "balance": 100000, "as_of": "2030-02", "rate": 0.12, "payment": 40000}]
+        f = metrics.finance_flow(self.conn, rows, y, None, None, debt)
+        # the log's House debt line becomes the Debt line: it is not counted twice
+        self.assertEqual((f["spending"], f["spending_thb"]), ({"fixed": 5000, "debt": 40000, "expense": 15000}, 60000))
+        self.assertEqual([(l["label"], l["detail"], l["amount"]) for l in f["spending_lines"]], [("Fixed costs", "", 5000), ("Debt", "House", 40000), ("Expenses", "", 15000)])
+        d = f["debts"][0]                    # 1% a month on what is still owed: 1,000, then 610, then 216.10
+        self.assertEqual((d["interest_thb"], d["principal_thb"], d["months_left"], d["paid_off"], d["interest_left_thb"]), (1000, 39000, 3, "2030-05", 1826.1))
+        self.assertEqual((f["gap_thb"], f["gap_after_thb"], f["needed_thb"], f["needed_after_thb"]), (60000, 20000, 6000000, 2000000))
+        self.assertEqual(f["debt_free"]["month"], "2030-05")
+        base = f["reach"]["months"]
+        self.assertGreater(base, 3)          # reached only after the debt is gone and the gap has dropped to 20,000
+
+        def months(planned=None, yields=y, reinvest=None, debts=debt):
+            return metrics.finance_flow(self.conn, rows, yields, None, planned, debts, reinvest)["reach"]["months"]
+
+        # every input moves the result
+        shop = [{"group": "Active", "name": "Salary", "amount": 100000}, {"group": "Active", "name": "Online Shop", "amount": 10000}]
+        more = metrics.finance_flow(self.conn, rows, y, None, {"income": shop}, debt)
+        self.assertEqual((more["gap_thb"], more["needed_thb"]), (50000, 5000000))
+        self.assertLess(more["reach"]["months"], base)
+        self.assertGreater(months({"spending": [{"group": "Expenses", "name": "Food", "amount": 30000}]}), base)
+        self.assertLess(months(yields={"stock": 0.2, "trading": 0.5}), base)
+        self.assertLess(months(reinvest={"stock": 30000}), base)
+        self.assertLess(months(reinvest={"freed": True}), base)
+        self.assertGreater(months(debts=[dict(debt[0], balance=2000000)]), base)
+        # a balance typed for an earlier month is rolled forward to the latest finished month
+        early = metrics.finance_flow(self.conn, rows, y, None, None, [dict(debt[0], as_of="2030-01")])["debts"][0]
+        self.assertEqual((early["rolled"], early["balance_thb"], early["paid_off"]), (True, 61000, "2030-04"))
+        # a payment that does not cover the interest never pays the loan off
+        never = metrics.finance_flow(self.conn, rows, y, None, None, [dict(debt[0], balance=9000000)])
+        self.assertEqual((never["debts"][0]["never"], never["debt_free"], never["spending"]["debt"]), (True, None, 40000))
+
+    def test_a_wealth_goal_is_measured_by_saving_or_emc(self):
+        self.assertEqual([metrics.goal_group({"bucket": b, "name": n}) for b, n in (("wealth", "EMC"), ("wealth", "Saving"), ("trading", "Trading"), (None, "OnTheWall"))],
+                         ["emc", "saving", "trading", None])
+
 
 if __name__ == "__main__":
     unittest.main()

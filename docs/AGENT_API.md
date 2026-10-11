@@ -46,10 +46,10 @@ Each write returns `{"id": ..., "audit_id": ...}`.
 | `POST /api/flows` | `account_id`, `on_date`, `amount_thb` (+ deposit, − withdrawal), `note` |
 | `POST /api/upcoming` | `due_date`, `item`, `kind` (Bill, Dividend, Restock, Rebalance, Entry), `amount_thb`, `done` |
 | `POST /api/projects` | `name`, `track`, `status`, `progress` (0 to 1), `next_step` |
-| `POST /api/advice` | `topic`, `body`, `noted_on` (default today), `refs` (the figures the note refers to) |
+| `POST /api/advice` | `topic`, `body`, `noted_on` (default today), `refs` (the figures the note refers to). A note whose `topic` contains “Plan” also shows in the Maki Advise box of the Plan page; `GET /api/plan` gives the figures to base it on |
 | `POST /api/benchmarks` | `name` (`VT`), `as_of`, `value` (month-end close in USD) |
 | `POST /api/trades` | `traded_on`, `pair`, `side` (L or S), `setup`, `grade`, `exit_plan`, `exit_actual`, `outcome` (win, loss, be), `pnl`, `balance`, `risk`, `note` |
-| `POST /api/cashflow` | `month` (YYYY-MM), `section` (income, fixed_cost, allocation), `line`, `amount_thb`, `note` |
+| `POST /api/cashflow` | `month` (YYYY-MM), `section` (income, fixed_cost, expense, allocation — shown as Reinvest, with the destination such as Investment, Trading, BTC or Saving as `line`), `line`, `amount_thb`, `note` |
 | `POST /api/assets` | `name`, `asset_class`, `value_thb`, `valued_on`, `debt_thb`, `monthly_income_thb`, `monthly_cost_thb`, `note` |
 | `PUT /api/<resource>/<id>` | Any of the fields above; fields left out keep their value |
 | `DELETE /api/<resource>/<id>` | Removes the row (logged, can be undone) |

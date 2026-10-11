@@ -85,7 +85,7 @@ class ImportTest(unittest.TestCase):
                           ("Stocks", "2026-02-26", 7000.0), ("Stocks", "2026-03-26", -5000.0)])
         self.assertTrue(any("EMC" in w for w in p["warnings"]))
         self.assertEqual({g["name"]: g["goal"] for g in p["goals"]},
-                         {"OnTheWall": 100000, "Stock": 900000, "Trading": 100000, "Saving": 60000, "EMC": 50000})
+                         {"OnTheWall": 100000, "Stock": 900000, "Trading": 100000, "Saving Bitcoin": 60000, "Saving Cash": 50000})
 
     def test_import_reconciles_and_states_return_net_of_flows(self):
         p = self.imp.parse(self.xlsx)

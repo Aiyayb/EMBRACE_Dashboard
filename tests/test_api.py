@@ -14,6 +14,11 @@ import auth  # noqa: E402
 import config  # noqa: E402
 import db  # noqa: E402
 
+try:
+    from openpyxl import Workbook
+except ImportError:
+    Workbook = None
+
 
 class ApiTest(unittest.TestCase):
     @classmethod
@@ -23,6 +28,7 @@ class ApiTest(unittest.TestCase):
         cfg = dict(config.load(), data_dir=cls.tmp.name, backup_dir=os.path.join(cls.tmp.name, "backups"),
                    shop_db_path=os.path.join(cls.tmp.name, "no-shop.db"),
                    family_xlsx_path=os.path.join(cls.tmp.name, "no-family.xlsx"),
+                   journal_workbook_path=os.path.join(cls.tmp.name, "journal.xlsx"),
                    agent_tokens=[{"name": "maki", "sha256": auth.hash_token(cls.token)}])
         cfg["db_path"] = os.path.join(cls.tmp.name, "t.db")
         cls.srv = app.make_server(cfg, port=0)
@@ -95,6 +101,125 @@ class ApiTest(unittest.TestCase):
         status, _ = self.call("POST", "/api/goals", {"year": 2031, "name": "Stock", "bucket": "investment",
                                                       "goal_thb": 1}, cookie="not-the-session")
         self.assertEqual(status, 401)
+
+    @unittest.skipIf(Workbook is None, "openpyxl not installed")
+    def test_sync_makes_the_trades_match_the_workbook(self):
+        from datetime import datetime
+        from sources.journal import DEFAULT_SHEET
+
+        def write(rows):
+            wb = Workbook()
+            ws = wb.active
+            ws.title = DEFAULT_SHEET
+            for n, (day, pair, win) in enumerate(rows, start=3):
+                ws.cell(n, 2, datetime(2031, 5, day))
+                ws.cell(n, 5, pair)
+                ws.cell(n, 22, 1 if win else None)
+                ws.cell(n, 25, 10.0 if win else None)
+            wb.save(os.path.join(self.tmp.name, "journal.xlsx"))
+        self.assertEqual(self.call("POST", "/api/journal/sync", cookie=auth.UI_KEY)[0], 404)       # no workbook yet
+        self.call("POST", "/api/trades", {"traded_on": "2031-01-01", "pair": "KEEP/ME", "pnl": 1}, cookie=auth.UI_KEY)   # typed in the page
+        write([(1, "BTC/USDT", True), (2, "ETH/USDT", True)])
+        self.assertEqual(self.call("POST", "/api/journal/sync")[0], 401)
+        status, out = self.call("POST", "/api/journal/sync", cookie=auth.UI_KEY)
+        self.assertEqual((status, out["trades"], out["added"]), (200, 2, 2))
+        self.assertEqual(sorted(t["pair"] for t in self.call("GET", "/api/trades")[1]), ["BTC/USDT", "ETH/USDT"])   # the typed one is gone
+        write([(1, "BTC/USDT", True)])                                                                             # one row removed in Excel
+        out = self.call("POST", "/api/journal/sync", cookie=auth.UI_KEY)[1]
+        self.assertEqual((out["trades"], out["added"], out["removed"]), (1, 0, 1))
+        self.assertEqual(len(self.call("GET", "/api/trades")[1]), 1)
+        self.assertFalse(self.call("GET", "/api/trading")[1]["journal_source"]["stale"])
+        self.assertEqual(self.call("POST", "/api/journal/open", token=self.token)[0], 403)                          # Maki may not open files
+        for t in self.call("GET", "/api/trades")[1]:                                                                # the database is shared by the tests
+            self.call("DELETE", f"/api/trades/{t['id']}", cookie=auth.UI_KEY)
+
+    def test_a_goal_carries_its_action_plan_and_the_plan_page_loads(self):
+        goal = {"year": 2044, "name": "Stock", "bucket": "investment", "goal_thb": 2000, "monthly_thb": 100, "growth_pct": 0.15, "note": "plan"}
+        status, made = self.call("POST", "/api/goals", goal, cookie=auth.UI_KEY)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.call("POST", "/api/goals", dict(goal, name="X", growth_pct=15), cookie=auth.UI_KEY)[0], 400)   # 15 is not a share
+        kept = next(g for g in self.call("GET", "/api/goals?year=2044")[1] if g["id"] == made["id"])
+        self.assertEqual((kept["monthly_thb"], kept["growth_pct"], kept["note"]), (100, 0.15, "plan"))
+        status, plan = self.call("GET", "/api/plan")
+        self.assertEqual(status, 200)
+        self.assertIn("advice", plan)
+        self.call("DELETE", f"/api/goals/{made['id']}", cookie=auth.UI_KEY)
+
+    def test_a_reinvest_line_is_also_the_deposit_into_where_it_went(self):
+        stocks, okx = self.account_id("Stocks"), self.account_id("OKX Trading")
+        flows = lambda acc: [f for f in self.call("GET", f"/api/flows?account_id={acc}")[1] if f["note"] == "Cash flow log · Reinvest"]   # noqa: E731
+        line = {"month": "2033-04", "section": "allocation", "line": "Stock", "amount_thb": 20000}
+        status, made = self.call("POST", "/api/cashflow", line, cookie=auth.UI_KEY)
+        self.assertEqual((status, made["deposit_to"]), (200, "Stocks"))
+        self.assertEqual([(f["on_date"], f["amount_thb"], f["kind"]) for f in flows(stocks)], [("2033-04-30", 20000, "deposit")])
+        self.call("PUT", f"/api/cashflow/{made['id']}", {"amount_thb": 25000}, cookie=auth.UI_KEY)                      # edited: the deposit follows
+        self.assertEqual([f["amount_thb"] for f in flows(stocks)], [25000])
+        self.call("PUT", f"/api/cashflow/{made['id']}", {"line": "Trading"}, cookie=auth.UI_KEY)                         # moved to another place
+        self.assertEqual((len(flows(stocks)), [f["amount_thb"] for f in flows(okx)]), (0, [25000]))
+        self.call("PUT", f"/api/cashflow/{made['id']}", {"line": "Saving Cash"}, cookie=auth.UI_KEY)                     # the ledger: nothing to mirror
+        self.assertEqual((len(flows(okx)), len(flows(stocks))), (0, 0))
+        self.call("PUT", f"/api/cashflow/{made['id']}", {"line": "Stock"}, cookie=auth.UI_KEY)
+        self.assertEqual(len(flows(stocks)), 1)
+        self.call("DELETE", f"/api/cashflow/{made['id']}", cookie=auth.UI_KEY)                                            # deleted: so is the deposit
+        self.assertEqual(len(flows(stocks)), 0)
+        income = self.call("POST", "/api/cashflow", {"month": "2033-04", "section": "income", "line": "Salary", "amount_thb": 5}, cookie=auth.UI_KEY)[1]
+        self.assertIsNone(income["deposit_to"])
+        self.call("DELETE", f"/api/cashflow/{income['id']}", cookie=auth.UI_KEY)
+
+    def test_goal_bars_give_a_years_goals_against_where_they_stand(self):
+        status, out = self.call("GET", "/api/goal-bars?year=2099")                 # a year with no Goal: nothing to draw
+        self.assertEqual(status, 200)
+        self.assertEqual(out["bars"], {})
+        status, out = self.call("GET", "/api/goal-bars")
+        self.assertEqual(status, 200)
+        self.assertIn("bars", out)
+
+    def test_plan_flow_rows_are_best_only_and_leave_the_log_alone(self):
+        rows = [{"group": "Active", "name": "Salary", "amount": 120000}, {"group": "Investment", "name": "Stock", "amount": 5000}]
+        body = {"box": "income", "rows": rows}
+        self.assertEqual(self.call("PUT", "/api/plan/flow", body, token=self.token)[0], 403)
+        self.assertEqual(self.call("PUT", "/api/plan/flow", {"box": "nope", "rows": rows}, cookie=auth.UI_KEY)[0], 400)
+        self.assertEqual(self.call("PUT", "/api/plan/flow", {"box": "income", "rows": [{"group": "Fixed costs", "name": "x", "amount": 1}]}, cookie=auth.UI_KEY)[0], 400)
+        self.assertEqual(self.call("PUT", "/api/plan/flow", {"box": "income", "rows": [{"group": "Active", "name": "x", "amount": -1}]}, cookie=auth.UI_KEY)[0], 400)
+        status, saved = self.call("PUT", "/api/plan/flow", body, cookie=auth.UI_KEY)
+        self.assertEqual((status, saved["income"][0]["amount"]), (200, 120000.0))
+        self.assertEqual(self.call("PUT", "/api/plan/flow", {"box": "income", "rows": None}, cookie=auth.UI_KEY), (200, {}))
+
+    def test_plan_debts_and_reinvest_are_best_only(self):
+        debt = {"name": "House debt", "balance": 2156326, "as_of": "2026-10", "rate": 0.031, "payment": 35000, "line": "House debt"}
+        self.assertEqual(self.call("PUT", "/api/plan/debts", {"debts": [debt]}, token=self.token)[0], 403)
+        self.assertEqual(self.call("PUT", "/api/plan/debts", {"debts": [dict(debt, rate=3.1)]}, cookie=auth.UI_KEY)[0], 400)      # 3.1 is not a share
+        self.assertEqual(self.call("PUT", "/api/plan/debts", {"debts": [dict(debt, payment=0)]}, cookie=auth.UI_KEY)[0], 400)
+        self.assertEqual(self.call("PUT", "/api/plan/debts", {"debts": [dict(debt, as_of="Oct 2026")]}, cookie=auth.UI_KEY)[0], 400)
+        self.assertEqual(self.call("PUT", "/api/plan/debts", {"debts": [debt, debt]}, cookie=auth.UI_KEY)[0], 400)
+        self.assertEqual(self.call("PUT", "/api/plan/debts", {"debts": [debt]}, cookie=auth.UI_KEY), (200, [debt]))
+        self.assertEqual(self.call("PUT", "/api/plan/debts", {"debts": []}, cookie=auth.UI_KEY), (200, []))
+        self.assertEqual(self.call("PUT", "/api/plan/reinvest", {"stock": 1}, token=self.token)[0], 403)
+        self.assertEqual(self.call("PUT", "/api/plan/reinvest", {"stock": -1}, cookie=auth.UI_KEY)[0], 400)
+        self.assertEqual(self.call("PUT", "/api/plan/reinvest", {"stock": 15000, "trading": None, "freed": True}, cookie=auth.UI_KEY), (200, {"freed": True, "stock": 15000.0}))
+        self.assertEqual(self.call("PUT", "/api/plan/reinvest", {}, cookie=auth.UI_KEY), (200, {"freed": False}))
+
+    def test_plan_yields_are_best_only_shares(self):
+        self.assertEqual(self.call("PUT", "/api/plan/yields", {"stock": 0.1, "trading": 0.3}, token=self.token)[0], 403)
+        self.assertEqual(self.call("PUT", "/api/plan/yields", {"stock": 15, "trading": 0.5}, cookie=auth.UI_KEY)[0], 400)      # 15 is not a share
+        self.assertEqual(self.call("PUT", "/api/plan/yields", {"stock": 0.12, "trading": 0.4}, cookie=auth.UI_KEY), (200, {"stock": 0.12, "trading": 0.4}))
+        self.call("PUT", "/api/plan/yields", {"stock": 0.15, "trading": 0.5}, cookie=auth.UI_KEY)
+
+    def test_cash_flow_takes_an_expense_section(self):
+        status, out = self.call("POST", "/api/cashflow", {"month": "2031-02", "section": "expense", "line": "Test", "amount_thb": 100}, cookie=auth.UI_KEY)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.call("POST", "/api/cashflow", {"month": "2031-02", "section": "bogus", "line": "x", "amount_thb": 1}, cookie=auth.UI_KEY)[0], 400)
+        self.call("DELETE", f"/api/cashflow/{out['id']}", cookie=auth.UI_KEY)
+
+    def test_a_wealth_card_is_deleted_with_its_rows_and_only_by_best(self):
+        status, card = self.call("POST", "/api/accounts", {"name": "Temp card", "bucket": "wealth", "currency": "THB",
+                                                           "opening_value": 100}, cookie=auth.UI_KEY)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.call("DELETE", f"/api/accounts/{card['id']}")[0], 401)
+        status, out = self.call("DELETE", f"/api/accounts/{card['id']}", cookie=auth.UI_KEY)
+        self.assertEqual((status, out["removed"]["snapshots"]), (200, 1))
+        self.assertNotIn("Temp card", [a["name"] for a in self.call("GET", "/api/accounts")[1]])
+        self.assertEqual(self.call("DELETE", f"/api/accounts/{card['id']}", cookie=auth.UI_KEY)[0], 404)
 
     def test_snapshot_needs_fx_rate_for_foreign_currency_and_rejects_duplicates(self):
         acc = self.account_id("OKX Trading")
@@ -198,10 +323,11 @@ class ApiTest(unittest.TestCase):
 
     def test_investment_page_carries_stats_growth_and_markets(self):
         inv = self.call("GET", "/api/investment")[1]
-        for key in ("stats", "growth_year", "growth", "markets"):
+        for key in ("stats", "growth_year", "growth", "markets", "benchmarks"):
             self.assertIn(key, inv)
         trading = self.call("GET", "/api/trading")[1]
         self.assertIn("stats", trading)
+        self.assertIn("benchmarks", trading)
         if trading["stats"]:
             self.assertIn("fx", trading["stats"])
 

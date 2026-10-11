@@ -99,7 +99,8 @@ function numberInput(value, attrs) {
 
 // ---------------------------------------------------------------- form dialog
 // fields: [{key, label, type: text|number|date|select|textarea|check, options: [[value, label]], required, hint}]
-function openForm({title, fields, values = {}, submit}) {
+// extra: [{label, class, onclick}] more buttons beside Cancel (the dialog closes when onclick succeeds)
+function openForm({title, fields, values = {}, submit, extra = []}) {
   const dialog = $('#dialog');
   const error = h('div', {class: 'form-error'});
   const inputs = {};
@@ -109,6 +110,14 @@ function openForm({title, fields, values = {}, submit}) {
     if (f.type === 'select') {
       input = h('select', null, f.options.map(([v, label]) => h('option', {value: v == null ? '' : v}, label)));
       input.value = value == null ? '' : value;
+    } else if (f.type === 'pick') {          // a list of names, and "Other…" to type a new one
+      input = h('select', null, [...f.options.map((o) => h('option', {value: o}, o)), h('option', {value: '__other'}, 'Other…')]);
+      const known = f.options.includes(value);
+      input.value = known ? value : (value ? '__other' : f.options[0]);
+      input.other = h('input', {type: 'text', placeholder: f.otherPlaceholder || 'Type the name'});
+      input.other.value = value && !known ? value : '';
+      input.other.hidden = input.value !== '__other';
+      input.addEventListener('change', () => { input.other.hidden = input.value !== '__other'; if (!input.other.hidden) input.other.focus(); });
     } else if (f.type === 'textarea') {
       input = h('textarea');
       input.value = value == null ? '' : value;
@@ -124,10 +133,13 @@ function openForm({title, fields, values = {}, submit}) {
     if (f.required) input.required = true;
     inputs[f.key] = input;
     if (f.type === 'check') return h('label', {class: 'field check'}, input, f.label);
-    return h('label', {class: 'field'}, f.hint ? `${f.label} — ${f.hint}` : f.label, input);
+    return h('label', {class: 'field'}, f.hint ? `${f.label} — ${f.hint}` : f.label, input, input.other || null);
   });
   const form = h('form', {class: 'form', method: 'dialog'}, h('h2', null, title), rows, error,
     h('div', {class: 'form-buttons'},
+      extra.map((x) => h('button', {type: 'button', class: x.class || 'btn', onclick: async () => {
+        try { await x.onclick(); dialog.close(); } catch (e) { error.textContent = e.message; }
+      }}, x.label)),
       h('button', {type: 'button', class: 'btn', onclick: () => dialog.close()}, 'Cancel'),
       h('button', {type: 'submit', class: 'btn dark'}, 'Save')));
   form.addEventListener('submit', async (event) => {
@@ -137,6 +149,7 @@ function openForm({title, fields, values = {}, submit}) {
       const input = inputs[f.key];
       if (f.type === 'check') body[f.key] = input.checked ? 1 : 0;
       else if (f.type === 'number') body[f.key] = numberOf(input);
+      else if (f.type === 'pick') body[f.key] = (input.value === '__other' ? input.other.value.trim() : input.value) || null;
       else body[f.key] = input.value === '' ? null : input.value;
     }
     try {
@@ -173,13 +186,18 @@ function noteIcon(note, title) {
 // ---------------------------------------------------------------- editable list
 // cfg: {title, resource, query, columns, filter(row), defaults(), onChange(), note, addLabel, canDelete}
 // column: {key, label, type, options, show(row), table: false, form: false, cls, required, hint}
+// the year a list was last shown for, so an edit that redraws the page does not jump back to the newest year
+const crudYear = {};
+
+// cfg.byYear: (row) => 'YYYY' puts year tabs in the card head and lists one year at a time (newest first)
 function crud(cfg) {
   const body = h('tbody');
+  const yearBox = h('div', {class: 'tabs year-tabs', role: 'tablist'});
   const shown = cfg.columns.filter((c) => c.table !== false);
   const editable = cfg.columns.filter((c) => c.form !== false);
   const card = h('article', {class: 'card'},
     h('div', {class: 'card-head'}, h('h2', {class: cfg.caps ? 'caps' : 'card-title'}, cfg.title),
-      h('button', {type: 'button', class: 'btn small', onclick: () => edit(null)}, cfg.addLabel || '+ Add')),
+      h('span', {class: 'row-gap'}, cfg.headExtra || null, cfg.byYear ? yearBox : null, cfg.noAdd ? null : h('button', {type: 'button', class: 'btn small add', onclick: () => edit(null)}, cfg.addLabel || '+ Add'))),
     cfg.note ? h('p', {class: 'note'}, cfg.note) : null,
     h('div', {class: 'table-wrap'}, h('table', null,
       h('thead', null, h('tr', null, shown.map((c) => h('th', {class: c.cls}, c.label)), h('th'))), body)));
@@ -205,6 +223,14 @@ function crud(cfg) {
       return;
     }
     if (cfg.filter) rows = rows.filter(cfg.filter);
+    if (cfg.sort) rows = [...rows].sort(cfg.sort);
+    if (cfg.byYear) {
+      const years = [...new Set(rows.map(cfg.byYear))].sort().reverse();
+      const key = cfg.title, year = years.includes(crudYear[key]) ? crudYear[key] : years[0];
+      yearBox.replaceChildren(...(years.length > 1 ? years.map((y) => h('button', {type: 'button', role: 'tab', 'aria-selected': String(y === year),
+        onclick: () => { crudYear[key] = y; refresh(); }}, y)) : []));
+      rows = rows.filter((r) => cfg.byYear(r) === year);
+    }
     body.replaceChildren(...rows.map((row) => h('tr', null,
       shown.map((c) => h('td', {class: c.cls}, display(c, row))),
       h('td', {class: 'actions'},
@@ -255,11 +281,13 @@ function niceTicks(lo, hi, count = 5) {
   return ticks;
 }
 
-// rows: [{month, ...}], series: [{key, name, color, dash, width}], opts: {format, fromZero}
+// rows: [{month, ...}], series: [{key, name, color, dash, width}], opts: {format, fromZero, bars: {key, name, color}}
+// bars draw one column per row behind the lines, on the same scale; the first series stays the one the hover rule follows
 function lineChart(host, rows, series, opts = {}) {
   const format = opts.format || signedPct;
   host.replaceChildren();
-  const values = rows.flatMap((r) => series.map((s) => r[s.key])).filter((v) => v != null);
+  const bars = opts.bars;
+  const values = rows.flatMap((r) => [...series.map((s) => r[s.key]), bars ? r[bars.key] : null]).filter((v) => v != null);
   if (rows.length < 2 || !values.length) { host.append(h('div', {class: 'empty'}, 'Not enough months to draw yet.')); return; }
   const W = Math.max(280, host.clientWidth), H = 280;
   const ticks = niceTicks(opts.fromZero === false ? Math.min(...values) : Math.min(0, ...values),
@@ -267,7 +295,8 @@ function lineChart(host, rows, series, opts = {}) {
   const lo = ticks[0], hi = ticks[ticks.length - 1];
   const axis = opts.axisFormat || format;
   const m = {top: 14, right: 16, bottom: 28, left: Math.max(...ticks.map((t) => axis(t).length)) * 6.6 + 14};
-  const x = (i) => m.left + (i * (W - m.left - m.right)) / (rows.length - 1);
+  const slot = (W - m.left - m.right) / rows.length;       // with bars every row owns a slot and its column is centred in it
+  const x = (i) => (bars ? m.left + (i + 0.5) * slot : m.left + (i * (W - m.left - m.right)) / (rows.length - 1));
   const y = (v) => H - m.bottom - ((v - lo) / (hi - lo)) * (H - m.top - m.bottom);
   const root = svg('svg', {viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': series.map((s) => s.name).join(' and ') + ' by month'});
   for (const t of ticks) {
@@ -280,13 +309,21 @@ function lineChart(host, rows, series, opts = {}) {
   rows.forEach((r, i) => {
     const text = opts.xLabel ? opts.xLabel(r) : (i % every ? null : MONTHS[Number(r.month.slice(5, 7)) - 1]);
     if (!text) return;
-    const label = svg('text', {class: 'tick', x: x(i), y: H - 8, 'text-anchor': opts.xLabel ? 'start' : 'middle'});
+    const anchor = opts.xAnchor === 'fit' ? (i === 0 ? 'start' : i === rows.length - 1 ? 'end' : 'middle') : opts.xLabel ? 'start' : 'middle';
+    const label = svg('text', {class: 'tick', x: x(i), y: H - 8, 'text-anchor': anchor});
     label.textContent = text;
     root.append(label);
   });
+  if (bars) {
+    rows.forEach((r, i) => {
+      if (r[bars.key] == null) return;
+      const top = y(Math.max(r[bars.key], 0)), bottom = y(Math.min(r[bars.key], 0)), w = Math.min(46, slot * 0.56);
+      root.append(svg('rect', {x: x(i) - w / 2, y: top, width: w, height: Math.max(1, bottom - top), rx: 4, fill: bars.color}));
+    });
+  }
   const lead0 = series[0];
   const lp = rows.map((r, i) => (r[lead0.key] == null ? null : [x(i), y(r[lead0.key])])).filter(Boolean);
-  if (lp.length > 1) {
+  if (lp.length > 1 && !bars) {
     const gid = `area-${Math.random().toString(36).slice(2, 8)}`;
     const grad = svg('linearGradient', {id: gid, x1: 0, y1: 0, x2: 0, y2: 1});
     [[0, .22], [.5, .08], [1, 0]].forEach(([o, a]) => grad.append(svg('stop', {offset: o, 'stop-color': lead0.color, 'stop-opacity': a})));
@@ -309,7 +346,7 @@ function lineChart(host, rows, series, opts = {}) {
   root.addEventListener('pointermove', (event) => {
     const box = host.getBoundingClientRect();
     const px = ((event.clientX - box.left) / box.width) * W;
-    let i = Math.round(((px - m.left) / (W - m.left - m.right)) * (rows.length - 1));
+    let i = bars ? Math.floor((px - m.left) / slot) : Math.round(((px - m.left) / (W - m.left - m.right)) * (rows.length - 1));
     i = Math.min(rows.length - 1, Math.max(0, i));
     const r = rows[i];
     const cy = r[lead.key] == null ? H - m.bottom : y(r[lead.key]);
@@ -319,6 +356,7 @@ function lineChart(host, rows, series, opts = {}) {
     tip.replaceChildren(h('div', {class: 'tip-head'}, monthLabel(r.month)),
       ...series.map((s) => h('div', {class: 'tip-line'},
         h('span', {class: 'tip-name'}, h('i', {class: 'tip-dot', style: `background: ${s.color}`}), s.name), h('b', null, r[s.key] == null ? '—' : format(r[s.key])))),
+      ...(bars ? [h('div', {class: 'tip-line'}, h('span', {class: 'tip-name'}, h('i', {class: 'tip-dot', style: `background: ${bars.color}`}), bars.name), h('b', null, r[bars.key] == null ? '—' : format(r[bars.key])))] : []),
       ...(opts.extra ? opts.extra(r).filter(Boolean).map(([label, text]) => h('div', {class: 'tip-line tip-extra'}, h('span', null, label), h('b', null, text))) : []),
       ...(opts.tipNote && opts.tipNote(r) ? [h('div', {class: 'tip-head'}, opts.tipNote(r))] : []));
     tip.style.display = 'block';
@@ -381,22 +419,24 @@ function donut(host, parts, center) {
 
 // ---------------------------------------------------------------- shared pieces
 // label, colour, page it opens. Saving and EMC are both Wealth Cards.
-const GROUPS = {investment: ['Investment', 'var(--mint)', 'investment'], trading: ['Trading', 'var(--ink)', 'trading'],
-  saving: ['Saving', 'var(--tan-light)', 'wealth'], emc: ['EMC', 'var(--tan)', 'wealth']};
+const GROUPS = {investment: ['Stock', 'var(--mint)', 'investment'], trading: ['Trading', 'var(--ink)', 'trading'],
+  saving: ['Bitcoin', 'var(--tan-light)', 'wealth'], emc: ['Cash', 'var(--tan)', 'wealth']};     // shown as Cash (Family Statement) and Bitcoin (Crypto)
 
-function tile(label, value, delta, valueSign, sub) {
+function tile(label, value, delta, valueSign, sub, change) {
+  // change: the same move in baht, shown between the % and the caption ("−1.1%  −฿11,192  MoM")
   return h('article', {class: 'card'},
     h('div', {class: 'tile-label'}, label),
     h('div', {class: `tile-value ${valueSign == null ? '' : signClass(valueSign)}`}, value),
     delta === undefined ? (sub ? h('div', {class: 'tile-sub'}, sub) : null)
-      : h('div', {class: 'tile-sub'}, h('span', {class: `delta ${signClass(delta)}`}, signedPct(delta)), h('span', null, sub || 'MoM')));
+      : h('div', {class: 'tile-sub'}, h('span', {class: `delta ${signClass(delta)}`}, signedPct(delta)),
+        change == null ? null : h('b', {class: `tile-return-val ${signClass(change)}`}, baht(change)), h('span', null, sub || 'MoM')));
 }
 
 // Performance Vs Benchmarks: growth in value (deposits counted) against SET. Two views: this year from the previous
-// December's close, and since 2023. Used by Home (Total Portfolio) and Investment. The caller draws it once it is in the page.
-function performanceCard({year, rowsYear, rowsAll, nameYear, nameAll, legend, bench = 'SET', title = 'Performance Vs Benchmarks', valueFmt = baht}) {
+// December's close, and since 2023. Used by Home (Total Portfolio) and Stock. The caller draws it once it is in the page.
+function performanceCard({year, rowsYear, rowsAll, nameYear, nameAll, legend, bench = 'SET', title = 'Performance Vs Benchmarks', valueFmt = baht, yearTab}) {
   const key = bench.toLowerCase();
-  const modes = {return: {tab: `Since Jan ${year}`, rows: rowsYear, name: nameYear, gap: true}};
+  const modes = {return: {tab: yearTab || `Since Jan ${year}`, rows: rowsYear, name: nameYear, gap: true}};
   if (rowsAll && rowsAll.length) modes.growth = {tab: 'Since 2023', rows: rowsAll, name: nameAll, gap: false};
   const tabs = h('div', {class: 'tabs', role: 'tablist'});
   const body = h('div', {class: 'stack'});
@@ -438,12 +478,20 @@ function bucketStatTiles(st, {fmt = baht, cagrNote = 'deposits counted'} = {}) {
     tile(abbr('YTD', 'Year to date'), fmt(st.ytd_amount), st.ytd_pct, st.ytd_amount, `since ${dec} close`),
     tile(abbr('CAGR', 'Compound annual growth rate'), st.cagr == null ? '—' : signedPct(st.cagr), undefined, st.cagr,
       st.cagr == null ? (st.cagr_months === undefined ? `needs 12 months of history (since ${monthLabel(st.cagr_since)})` : `needs 3 months of trades (since ${monthLabel(st.cagr_since)})`)
-        : st.cagr_months != null && st.cagr_months < 12 ? `since ${monthLabel(st.cagr_since)} · annualised from ${st.cagr_months} months, not a full year`
+        : st.cagr_months != null && st.cagr_months < 12 ? h('span', {title: `Annualised from ${st.cagr_months} months, not a full year`}, `since ${monthLabel(st.cagr_since)}`)
         : `since ${monthLabel(st.cagr_since)} · ${cagrNote}`)];
 }
 
-function pageHead(title, note) {
+// tabs (optional): the year tabs at the top right; the note then drops to its own line
+function pageHead(title, note, tabs) {
+  if (tabs) return h('div', {class: 'page-head'}, h('h2', {class: 'page-title'}, title), tabs, note ? h('p', {class: 'note', style: 'flex-basis: 100%; margin: 0'}, note) : null);
   return h('div', {class: 'page-head'}, h('h2', {class: 'page-title'}, title), note ? h('p', {class: 'note'}, note) : null);
+}
+
+// year tabs for a page: `go(page, year)` on click
+function yearTabs(page, years, current) {
+  return h('div', {class: 'tabs', role: 'tablist'}, years.map((y) =>
+    h('button', {type: 'button', role: 'tab', 'aria-selected': String(y === current), onclick: () => go(page, y)}, y)));
 }
 
 function setChips(k) {
@@ -459,7 +507,62 @@ function setChips(k) {
 
 const accountOptions = (accounts) => accounts.map((a) => [a.id, `${a.name} (${a.currency})`]);
 
-// ---------------------------------------------------------------- Investment Portfolio editor
+// ---------------------------------------------------------------- benchmark prices inside a month's form
+// A table of the month's benchmark prices (names: which benchmarks this page may enter), saved as Benchmark rows. A price
+// left empty is no price; clearing one that was saved removes it. Existing prices keep their own date, new ones take `date`.
+function benchmarkField({all, row, date, names, defaults}) {
+  const monthOf = (iso) => (iso || '').slice(0, 7);
+  const inMonth = (b) => row && names.includes(b.name) && monthOf(b.as_of) === monthOf(row.as_of);
+  const rows = [], removed = [];
+  const body = h('tbody');
+  const addBench = (b) => {
+    const name = h('select', {'aria-label': 'Benchmark'}, [...new Set([...names, b.name])].map((n) => h('option', {value: n}, n)));
+    name.value = b.name;
+    const price = numberInput(b.value, {class: 'num', 'aria-label': 'Price', placeholder: '—'});
+    const entry = {id: b.id || null, as_of: b.as_of || null, name, price};
+    const tr = h('tr', null, h('td', null, name), h('td', null, price), h('td', {class: 'muted small'}, b.as_of ? fmtDay(b.as_of) : ''),
+      h('td', null, h('button', {type: 'button', class: 'x', title: 'Remove row', 'aria-label': 'Remove row', onclick: () => {
+        tr.remove(); rows.splice(rows.indexOf(entry), 1); if (entry.id) removed.push(entry.id);
+      }}, '×')));
+    rows.push(entry);
+    body.append(tr);
+  };
+  const have = all.filter(inMonth);
+  have.forEach(addBench);
+  for (const n of defaults) if (!have.some((b) => b.name === n)) addBench({name: n});      // an empty row to type into
+  return {
+    nodes: [h('div', {class: 'field'}, 'Benchmark prices (month-end close)',
+      h('table', {class: 'hold'}, h('thead', null, h('tr', null, h('th', null, 'Benchmark'), h('th', {class: 'num'}, 'Price'), h('th', null, ''), h('th'))), body)),
+    h('div', {class: 'hold-total'}, h('button', {type: 'button', class: 'btn small add', onclick: () => addBench({name: names[0]})}, '+ Add benchmark'), h('span'))],
+    validate() {
+      const typed = rows.filter((b) => numberOf(b.price) != null);
+      if (typed.some((b) => numberOf(b.price) <= 0)) return 'A benchmark price must be above zero (leave it empty for none).';
+      if (new Set(typed.map((b) => `${b.name.value}|${b.as_of || date.value}`)).size !== typed.length) return 'The same benchmark appears twice for one date.';
+      return '';
+    },
+    async save() {       // after the snapshot is saved; one audited write each. Returns a message if one failed.
+      try {
+        for (const id of removed) await api('DELETE', `/api/benchmarks/${id}`);
+        for (const b of rows) {
+          const price = numberOf(b.price);
+          if (b.id && price == null) await api('DELETE', `/api/benchmarks/${b.id}`);
+          else if (b.id) await api('PUT', `/api/benchmarks/${b.id}`, {name: b.name.value, as_of: b.as_of, value: price});
+          else if (price != null) await api('POST', '/api/benchmarks', {name: b.name.value, as_of: date.value, value: price});
+        }
+        return '';
+      } catch (e) { return e.message; }
+    },
+  };
+}
+
+// the Note icon of a month opens the benchmark prices recorded that month (of these names) with its note
+function monthNote(r, all, names) {
+  const prices = all.filter((b) => names.includes(b.name) && b.as_of.slice(0, 7) === r.as_of.slice(0, 7))
+    .map((b) => `${b.name}: ${number(b.value)}${b.as_of === r.as_of ? '' : ` (${fmtDay(b.as_of)})`}`);
+  return [prices.length ? `Benchmark prices\n${prices.join('\n')}` : '', r.note || ''].filter(Boolean).join('\n\n');
+}
+
+// ---------------------------------------------------------------- Stock Portfolio editor
 // One Snapshot per Account and date, entered as a table of holdings (Market, Stock, Qty, Value in THB). The Snapshot's
 // value is the sum of the Values; the server does the adding.
 const MARKETS = ['SET', 'US', 'HK', 'JP', 'KR', 'CN', 'CASH', 'OTHER'];
@@ -467,7 +570,7 @@ const marketLabel = (m) => (m === 'CASH' ? 'Cash' : m === 'OTHER' ? 'Other' : m 
 const MARKET_COLORS = {SET: 'var(--mint)', US: 'var(--ink)', HK: 'var(--tan)', JP: 'var(--tan-light)', KR: 'var(--grey)', CN: '#c98a72',
   CASH: '#b8c7d6', OTHER: '#d9d9d4', '': '#e6e6e1'};
 
-async function portfolioEditor(accounts, row, done) {
+async function portfolioEditor(accounts, row, done, allBenchmarks = []) {
   const dialog = $('#dialog');
   dialog.style.width = 'min(700px, calc(100vw - 32px))';
   const error = h('div', {class: 'form-error'});
@@ -515,28 +618,34 @@ async function portfolioEditor(accounts, row, done) {
   };
   seed.forEach(addRow);
 
-  const form = h('form', {class: 'form', method: 'dialog'}, h('h2', null, `${row ? 'Edit' : 'Add'} — Investment Portfolio`),
+  const bench = benchmarkField({all: allBenchmarks, row, date, names: ['SET'], defaults: ['SET']});
+
+  const form = h('form', {class: 'form', method: 'dialog'}, h('h2', null, `${row ? 'Edit' : 'Add'} — Stock Portfolio`),
     h('label', {class: 'field'}, 'Account', account),
     h('label', {class: 'field'}, 'Date', date),
     h('div', {class: 'field'}, 'Holdings (values in THB)',
       h('table', {class: 'hold'}, h('thead', null, h('tr', null, h('th', null, 'Market'), h('th', null, 'Stock'), h('th', {class: 'num'}, 'Qty'), h('th', {class: 'num'}, 'Value'), h('th'))), body)),
-    h('div', {class: 'hold-total'}, h('button', {type: 'button', class: 'btn small', onclick: () => addRow({market: 'SET'})}, '+ Add row'),
+    h('div', {class: 'hold-total'}, h('button', {type: 'button', class: 'btn small add', onclick: () => addRow({market: 'SET'})}, '+ Add row'),
       h('span', null, 'Total ', total)),
+    ...bench.nodes,
     h('label', {class: 'field'}, 'Note', note),
     error,
     h('div', {class: 'form-buttons'}, h('button', {type: 'button', class: 'btn', onclick: () => dialog.close()}, 'Cancel'), h('button', {type: 'submit', class: 'btn dark'}, 'Save')));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
+    const badPrice = bench.validate();
+    if (badPrice) { error.textContent = badPrice; return; }
     const holdings = rowsData.filter((r) => r.stock.value.trim() || numberOf(r.qty) != null || numberOf(r.value) != null)
       .map((r) => ({market: r.market.value, stock: r.stock.value.trim(), qty: numberOf(r.qty), value_thb: numberOf(r.value)}));
     if (!holdings.length || holdings.some((x) => !(x.value_thb > 0))) { error.textContent = 'Every row needs a Value above zero. Remove the rows you do not need.'; return; }
     try {
       await api(row ? 'PUT' : 'POST', `/api/snapshots${row ? '/' + row.id : ''}`,
         {account_id: Number(account.value), as_of: date.value, holdings, note: note.value.trim() || null});
-      dialog.close();
-      toast(row ? 'Saved.' : 'Added.');
-      done();
-    } catch (e) { error.textContent = e.message; }
+    } catch (e) { error.textContent = e.message; return; }
+    const failed = await bench.save();
+    dialog.close();
+    toast(failed ? `Saved, but a benchmark price was not: ${failed}` : (row ? 'Saved.' : 'Added.'));
+    done();
   });
   dialog.replaceChildren(form);
   dialog.showModal();
@@ -577,6 +686,15 @@ const JOURNAL_COLS = [
   {key: 'balance', label: 'Balance', calc: true, cls: 'r', show: (t) => number(t.balance)},
   {key: 'risk', label: 'Risk / Trade', calc: true, cls: 'r', show: (t) => number(t.risk)},
 ];
+
+// a read-only popup for a long text
+function showText(title, text) {
+  const dialog = $('#dialog');
+  dialog.style.width = 'min(520px, calc(100vw - 32px))';
+  dialog.replaceChildren(h('div', {class: 'form'}, h('h2', null, title), h('p', {style: 'white-space: pre-wrap; margin: 0'}, text),
+    h('div', {class: 'form-buttons'}, h('button', {type: 'button', class: 'btn', onclick: () => dialog.close()}, 'Close'))));
+  dialog.showModal();
+}
 
 // reload(): refetches the page's data and calls grid.setRows; returns when the new rows are drawn
 function journalGrid(reload) {
@@ -620,10 +738,10 @@ function journalGrid(reload) {
     }), h('button', {type: 'button', role: 'tab', 'aria-selected': String(month === 'all'), onclick: () => { month = 'all'; draw(); }}, `All · ${rows.length}`));
     body.replaceChildren(...rows.map((t, n) => [t, n]).filter(([t]) => month === 'all' || t.traded_on.startsWith(month)).map(([t, n]) => h('tr', {'data-id': t.id},
       h('td', {class: 'calc r'}, n + 1),
-      JOURNAL_COLS.map((c) => h('td', {'data-key': c.key, class: `${c.calc ? 'calc' : 'edit'} ${c.cls || ''} ${c.type === 'note' ? 'note-cell' : ''}`,
-        title: c.type === 'note' ? (t.note || '') : null, onclick: c.calc ? null : (e) => startEdit(e.currentTarget, t, c)}, display(c, t))),
-      h('td', {class: 'calc'}, h('button', {type: 'button', class: 'x', title: 'Delete this trade', 'aria-label': 'Delete this trade', onclick: () => remove(t)}, '×')))));
-    if (!rows.length) body.append(h('tr', null, h('td', {class: 'empty', colspan: JOURNAL_COLS.length + 2}, 'No trades yet. Add the first one.')));
+      JOURNAL_COLS.map((c) => h('td', {'data-key': c.key, class: `${c.calc ? 'calc' : ''} ${c.cls || ''} ${c.type === 'note' ? 'note-cell' : ''}`,
+        title: c.type === 'note' ? (t.note || '') : null, onclick: c.type === 'note' && t.note ? () => showText(`Note — ${fmtDay(t.traded_on)}`, t.note) : null}, display(c, t))),
+      h('td', {class: 'calc'}))));
+    if (!rows.length) body.append(h('tr', null, h('td', {class: 'empty', colspan: JOURNAL_COLS.length + 2}, 'No trades yet. Add them in the Excel journal, then press Sync Excel.')));
     const first = head.firstChild.getBoundingClientRect().height;
     for (const th of head.lastChild.children) th.style.top = `${first}px`;      // second header row sticks under the first
   }
@@ -775,7 +893,7 @@ function shopMonthEditor({standard, existing, year, month, payout, done}) {
       const names = [...standard[id], ...Object.keys(have[id] || {}).filter((n) => !standard[id].includes(n))];
       const typed = (n) => ((have[id] || {})[n] == null && id === 'dividend' && !Object.keys(have).length ? payout : (have[id] || {})[n]);   // a new month starts from the last rate
       const box = h('fieldset', {class: 'fin-sec'}, h('legend', null, title), ...names.map((n, i) => lineRow(id, n, typed(n), i >= standard[id].length)));
-      if (id !== 'dividend') box.append(h('button', {type: 'button', class: 'btn small', onclick: (e) => e.currentTarget.before(lineRow(id, '', null, true))}, '+ Add line'));
+      if (id !== 'dividend') box.append(h('button', {type: 'button', class: 'btn small add', onclick: (e) => e.currentTarget.before(lineRow(id, '', null, true))}, '+ Add line'));
       return box;
     }));
   };
@@ -783,7 +901,7 @@ function shopMonthEditor({standard, existing, year, month, payout, done}) {
   monthInput.addEventListener('change', fill);
   fill();
 
-  const form = h('form', {class: 'form', method: 'dialog'}, h('h2', null, 'EMBRACE Shop — one month'),
+  const form = h('form', {class: 'form', method: 'dialog'}, h('h2', null, 'Online Shop — one month'),
     h('div', {class: 'shop-when'}, h('label', {class: 'field'}, 'Year', yearInput), h('label', {class: 'field'}, 'Month', monthInput)),
     h('p', {class: 'note'}, 'Leave a box empty for no data (it is not counted as 0). Type 0 when the amount really was zero. Clear every box to remove the month.'),
     body, error,
@@ -803,7 +921,65 @@ function shopMonthEditor({standard, existing, year, month, payout, done}) {
   dialog.showModal();
 }
 
-// Snapshots and Flows lists for a set of Accounts (used by Investment, Trading and Wealth)
+// ---------------------------------------------------------------- Trading Portfolio editor
+// Same idea as the Stock Portfolio form, with the Trading detail kept: Account, Date, Value, FX rate, Note, and the BTC price.
+async function tradingEditor(accounts, row, done, allBenchmarks = []) {
+  const dialog = $('#dialog');
+  dialog.style.width = 'min(560px, calc(100vw - 32px))';
+  const error = h('div', {class: 'form-error'});
+  const account = h('select', null, accounts.map((a) => h('option', {value: a.id}, `${a.name} (${a.currency})`)));
+  account.value = row ? row.account_id : accounts[0].id;
+  const date = h('input', {type: 'date', required: true});
+  date.value = row ? row.as_of : today();
+  const value = numberInput(row ? row.value_native : null, {class: 'num', required: true});
+  const fx = numberInput(row && row.fx_rate !== 1 ? row.fx_rate : null, {class: 'num'});
+  const fxField = h('label', {class: 'field'}, 'FX rate — THB per 1 unit of the Account’s currency', fx);
+  const note = h('input', {type: 'text', placeholder: 'Note (optional)'});
+  note.value = row && row.note ? row.note : '';
+  const currencyOf = () => (accounts.find((a) => String(a.id) === String(account.value)) || {}).currency || 'THB';
+  const valueLabel = h('span', null);
+  const sync = async (prefill) => {
+    const cur = currencyOf();
+    fxField.hidden = cur === 'THB';
+    valueLabel.textContent = `Value (${cur})`;
+    if (prefill && cur !== 'THB' && !row) {          // a new month starts from the last rate used for this Account
+      try { const last = (await api('GET', `/api/snapshots?account_id=${account.value}`))[0]; if (last && last.fx_rate !== 1 && !fx.value) fx.value = groupDigits(last.fx_rate); } catch (e) { /* type it */ }
+    }
+  };
+  account.addEventListener('change', () => sync(true));
+  await sync(true);
+  const bench = benchmarkField({all: allBenchmarks, row, date, names: ['BTC'], defaults: ['BTC']});
+  const form = h('form', {class: 'form', method: 'dialog'}, h('h2', null, `${row ? 'Edit' : 'Add'} — Trading Portfolio`),
+    h('label', {class: 'field'}, 'Account', account),
+    h('label', {class: 'field'}, 'Date', date),
+    h('label', {class: 'field'}, valueLabel, value),
+    fxField,
+    ...bench.nodes,
+    h('label', {class: 'field'}, 'Note', note),
+    error,
+    h('div', {class: 'form-buttons'}, h('button', {type: 'button', class: 'btn', onclick: () => dialog.close()}, 'Cancel'), h('button', {type: 'submit', class: 'btn dark'}, 'Save')));
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const amount = numberOf(value);
+    if (amount == null) { error.textContent = 'Enter the value.'; return; }
+    const rate = numberOf(fx);
+    if (currencyOf() !== 'THB' && !(rate > 0)) { error.textContent = `Enter the FX rate (THB per 1 ${currencyOf()}).`; return; }
+    const badPrice = bench.validate();
+    if (badPrice) { error.textContent = badPrice; return; }
+    try {
+      await api(row ? 'PUT' : 'POST', `/api/snapshots${row ? '/' + row.id : ''}`,
+        {account_id: Number(account.value), as_of: date.value, value_native: amount, fx_rate: currencyOf() === 'THB' ? null : rate, note: note.value.trim() || null});
+    } catch (e) { error.textContent = e.message; return; }
+    const failed = await bench.save();
+    dialog.close();
+    toast(failed ? `Saved, but a benchmark price was not: ${failed}` : (row ? 'Saved.' : 'Added.'));
+    done();
+  });
+  dialog.replaceChildren(form);
+  dialog.showModal();
+}
+
+// Snapshots and Flows lists for a set of Accounts (used by Stock, Trading and Wealth)
 function accountLists(accounts, rerender) {
   const manual = accounts.filter((a) => a.source === 'manual');
   const ids = new Set(manual.map((a) => a.id));
@@ -813,7 +989,7 @@ function accountLists(accounts, rerender) {
   if (!manual.length) return [];
   return [
     crud({
-      title: 'Monthly values', resource: 'snapshots', filter: (r) => ids.has(r.account_id), onChange: rerender,
+      title: 'Monthly values', resource: 'snapshots', filter: (r) => ids.has(r.account_id), byYear: (r) => r.as_of.slice(0, 4), onChange: rerender,
       note: 'One value per Account per date. For an Account not in THB, enter the FX rate used.',
       defaults: () => ({account_id: manual[0].id, as_of: today()}),
       columns: [
@@ -828,7 +1004,7 @@ function accountLists(accounts, rerender) {
       ],
     }),
     crud({
-      title: 'Deposits and withdrawals', resource: 'flows', filter: (r) => ids.has(r.account_id), onChange: rerender,
+      title: 'Deposits and withdrawals', resource: 'flows', filter: (r) => ids.has(r.account_id), byYear: (r) => r.on_date.slice(0, 4), onChange: rerender,
       note: 'Record every deposit (+) and withdrawal (−) in the month it happened, or that month’s return is wrong.',
       defaults: () => ({account_id: manual[0].id, on_date: today()}),
       columns: [
@@ -856,18 +1032,442 @@ function accountCards(accounts) {
 }
 
 // ---------------------------------------------------------------- pages
+// ---------------------------------------------------------------- Cash Flow log editor
+// Where the money goes, picked step by step: what kind of money (buttons), which month, which item (a list, so every month spells
+// it the same way), the amount and a note. "Other" is for something new; once saved it joins the list.
+const CASHFLOW_TYPES = [
+  ['income', 'Income', 'Money coming in', 'Source'],
+  ['fixed_cost', 'Fixed costs', 'Costs that repeat every month', 'Item'],
+  ['allocation', 'Reinvest', 'Money moved into another asset; also recorded as a deposit in Stock, Trading or Saving Bitcoin', 'Reinvest into'],
+  ['expense', 'Expense', 'Everyday and one-off spending', 'What for'],
+];
+const CASHFLOW_ITEMS = {
+  income: ['Salary', 'Online Shop', 'Trading', 'Stock dividend'],
+  fixed_cost: ['House debt', 'Living Cost', 'Life Ins', 'Health Ins', 'Social Ins', 'Utility', 'EMC', 'Support Haki'],
+  expense: [],
+  allocation: ['Stock', 'Trading', 'Saving Cash', 'Saving Bitcoin'],
+};
+// where a Reinvest destination lives in the dashboard
+const REINVEST_TAB = {Stock: 'investment', Trading: 'trading', 'Saving Cash': 'wealth', 'Saving Bitcoin': 'wealth'};
+const cashflowLabel = (section) => (CASHFLOW_TYPES.find((t) => t[0] === section) || [section, section])[1];
+
+// items of a section: the standard ones, then every other name already used in that section (most used first)
+function cashflowItems(section, lines) {
+  const used = new Map();
+  for (const l of lines) if (l.section === section) used.set(l.line, (used.get(l.line) || 0) + 1);
+  const standard = CASHFLOW_ITEMS[section];
+  return [...standard, ...[...used.keys()].filter((n) => !standard.includes(n)).sort((a, b) => used.get(b) - used.get(a))];
+}
+
+// row: the entry being edited, or null; lines: every Cash Flow line (for the lists and the duplicate check); month: 'YYYY-MM' to start on
+function cashflowEditor(row, lines, month) {
+  const dialog = $('#dialog');
+  dialog.style.width = 'min(520px, calc(100vw - 32px))';
+  const error = h('div', {class: 'form-error'});
+  let section = row ? row.section : 'expense';
+  const monthInput = h('input', {type: 'month', required: true});
+  monthInput.value = row ? row.month : (month || today().slice(0, 7));
+  const amount = numberInput(row ? row.amount_thb : null, {class: 'num', placeholder: '0', required: true});
+  const note = h('input', {type: 'text', placeholder: 'Note (optional)'});
+  note.value = row && row.note ? row.note : '';
+  const item = h('select', {'aria-label': 'Item'});
+  const other = h('input', {type: 'text', placeholder: 'Name the new item'});
+  const itemLabel = h('span', null);
+  const hint = h('p', {class: 'note', style: 'margin: -4px 0 0'});
+  const segment = h('div', {class: 'seg', role: 'tablist'});
+
+  const fillItems = (keep) => {
+    const names = cashflowItems(section, lines);
+    item.replaceChildren(...names.map((n) => h('option', {value: n}, n)), h('option', {value: '__other'}, 'Other…'));
+    if (keep && names.includes(keep)) item.value = keep;
+    else if (keep) { item.value = '__other'; other.value = keep; }
+    else item.value = names.length ? names[0] : '__other';
+    other.hidden = item.value !== '__other';
+  };
+  const drawType = () => {
+    const t = CASHFLOW_TYPES.find((x) => x[0] === section);
+    segment.replaceChildren(...CASHFLOW_TYPES.map(([id, label]) => h('button', {type: 'button', role: 'tab', class: `seg-${id}`, 'aria-selected': String(id === section),
+      onclick: () => { section = id; other.value = ''; drawType(); fillItems(); } }, label)));
+    hint.textContent = t[2];
+    itemLabel.textContent = t[3];
+  };
+  item.addEventListener('change', () => { other.hidden = item.value !== '__other'; if (!other.hidden) other.focus(); });
+  drawType();
+  fillItems(row ? row.line : null);
+
+  const form = h('form', {class: 'form', method: 'dialog'}, h('h2', null, `${row ? 'Edit' : 'Add'} — Cash flow log`),
+    h('div', {class: 'field'}, 'What kind of money is it?', segment), hint,
+    h('label', {class: 'field'}, 'Month', monthInput),
+    h('label', {class: 'field'}, itemLabel, item, other),
+    h('label', {class: 'field'}, 'Amount (THB)', amount),
+    h('label', {class: 'field'}, 'Note', note),
+    error,
+    h('div', {class: 'form-buttons'}, h('button', {type: 'button', class: 'btn', onclick: () => dialog.close()}, 'Cancel'), h('button', {type: 'submit', class: 'btn dark'}, 'Save')));
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const name = (item.value === '__other' ? other.value : item.value).trim();
+    const value = numberOf(amount);
+    if (!name) { error.textContent = 'Name the item.'; return; }
+    if (value == null) { error.textContent = 'Enter the amount.'; return; }
+    if (lines.some((l) => l.month === monthInput.value && l.section === section && l.line.toLowerCase() === name.toLowerCase() && (!row || l.id !== row.id))) {
+      error.textContent = `${cashflowLabel(section)} › ${name} already has an entry for ${monthLabel(monthInput.value)}. Edit that one instead.`;
+      return;
+    }
+    let out;
+    try {
+      out = await api(row ? 'PUT' : 'POST', `/api/cashflow${row ? '/' + row.id : ''}`,
+        {month: monthInput.value, section, line: name, amount_thb: value, note: note.value.trim() || null});
+    } catch (e) { error.textContent = e.message; return; }
+    dialog.close();
+    toast(`${row ? 'Saved.' : 'Added.'}${out.deposit_to ? ` Also recorded as a deposit in ${out.deposit_to}.` : ''}`);
+    go('expense', monthInput.value);
+  });
+  dialog.replaceChildren(form);
+  dialog.showModal();
+}
+
+// ---------------------------------------------------------------- Plan pieces (the Plan page and Home share them)
+const planSpan = (m) => (m >= 12 ? `${Math.floor(m / 12)} yr${m % 12 ? ` ${m % 12} mo` : ''}` : `${m} month${m === 1 ? '' : 's'}`);
+const planMeter = (share, cls = '') => h('div', {class: `meter ${cls}`},
+  h('div', {class: 'bar'}, h('span', {style: `width: ${Math.min(1, Math.max(0, share || 0)) * 100}%`})), h('b', null, share == null ? '—' : `${Math.round(share * 100)}%`));
+const planFact = (label, value, sub, cls = '') => h('div', {class: 'fact'}, h('span', {class: 'fact-label'}, label), h('b', {class: cls}, value), sub ? h('span', {class: 'fact-sub'}, sub) : null);
+
+// this year's target: the value aimed at by December, how far along, what is left
+function planYearCard(t, home = false) {
+  const span = planSpan, meter = planMeter, fact = planFact, asOf = monthLabel(t.month);
+  const behind = t.expected_thb == null ? null : t.actual_thb - t.expected_thb;
+  return h('article', {class: 'card plan-hero'},
+    h('div', {class: 'card-head'}, h('h2', {class: 'caps'}, home ? `${t.year} portfolio goal` : `${t.year} target`), h('span', {class: 'chip'}, t.months_left ? `${span(t.months_left)} left` : 'year end')),
+    // on Home: where the portfolio stands over where it is going; on Plan: the target on its own, with the boxes below
+    home ? h('div', {class: 'hero-value'}, baht(t.actual_thb), h('span', {class: 'hero-of'}, ` / ${baht(t.target_thb)}`))
+      : h('div', {class: 'hero-value'}, baht(t.target_thb)),
+    // on Home the bar comes first and the words under it; on Plan the words first
+    ...(() => { const words = h('div', {class: 'note'}, home ? `Total at end of ${asOf} / Target by Dec ${t.year}` : `Total Portfolio Value by Dec ${t.year}`), bar = meter(t.progress, 'green'); return home ? [bar, words] : [words, bar]; })(),
+    home ? null : h('div', {class: 'facts'},
+      fact('Now', baht(t.actual_thb), `end of ${asOf}`),
+      fact(t.gap_thb > 0 ? 'To go' : 'Above target', baht(Math.abs(t.gap_thb)), t.opening_thb == null ? null : `started the year at ${baht(t.opening_thb)}`),
+      t.per_month_thb != null && t.gap_thb > 0 ? fact('Needed per month', baht(t.per_month_thb), `for the ${span(t.months_left)} left`) : null),
+    behind == null ? null : h('p', {class: `note ${behind < 0 ? 'warn' : ''}`},
+      `A straight line from the year’s opening value to the target would be at ${baht(t.expected_thb)} by now: `
+      + (behind < 0 ? `${baht(-behind)} behind.` : `${baht(behind)} ahead.`)),
+    t.stale.length ? h('p', {class: 'note'}, `Carried forward from an earlier month: ${t.stale.join(', ')}.`) : null);
+}
+
+const PLAN_SHOW = {Stock: ['Stock', 'investment', 'var(--mint)'], Trading: ['Trading', 'trading', 'var(--ink)'],
+  'Saving Bitcoin': ['Saving Bitcoin', 'wealth', 'var(--tan-light)'], 'Saving Cash': ['Saving Cash', 'wealth', 'var(--tan)'], OnTheWall: ['Online Shop', 'shop', 'var(--grey)']};
+const planOrder = (g) => { const k = ['Stock', 'Trading', 'OnTheWall', 'Saving Cash', 'Saving Bitcoin'].indexOf(g.name); return k < 0 ? 9 : k; };
+const goalLabel = (name) => (PLAN_SHOW[name] || [name])[0];
+const goalTableOrder = (a, b) => ['Stock', 'Trading', 'Saving Cash', 'Saving Bitcoin', 'OnTheWall'].indexOf(a.name) - ['Stock', 'Trading', 'Saving Cash', 'Saving Bitcoin', 'OnTheWall'].indexOf(b.name);
+
+// Home: one line per Goal of the year, a black progress bar and what is left
+function planGoalRows(t) {
+  return h('div', {class: 'goal-rows'}, [...t.items].sort((a, b) => planOrder(a) - planOrder(b)).map((g) => {
+    const [label, page, colour] = PLAN_SHOW[g.name] || [g.name, null, 'var(--grey)'];
+    const left = g.gap_thb;
+    const share = Math.min(1, Math.max(0, g.progress || 0));
+    const row = h('div', {class: 'goal-line', role: page ? 'link' : null, tabindex: page ? 0 : null, title: `${label}: ${baht(g.actual_thb)} of ${baht(g.goal_thb)}${g.as_of ? ` (as of ${fmtDay(g.as_of)})` : ''}`},
+      h('span', {class: 'goal-line-name'}, h('i', {class: 'dot', style: `background: ${colour}`}), label),
+      h('div', {class: 'goal-bar'}, h('span', {class: 'goal-nums'}, `${baht(g.actual_thb)} / ${baht(g.goal_thb)}`),
+        h('div', {class: 'goal-track'}, h('span', {style: `width: ${share * 100}%`}))),
+      h('b', {class: 'goal-line-pct'}, g.progress == null ? '—' : `${Math.round(g.progress * 100)}%`),
+      h('span', {class: `goal-line-left ${left != null && left <= 0 ? 'up' : ''}`}, left == null ? '—' : left <= 0 ? `+${baht(-left)} over` : `${baht(left)} left`));
+    if (page) { row.addEventListener('click', () => go(page)); row.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(page); }); }
+    return row;
+  }));
+}
+
+// one card per Goal of the year; compact leaves out the plan's note and growth, for Home
+function planGoalCards(t, compact = false) {
+  const meter = planMeter;
+  const goalCard = (g) => {
+    const [label, page, colour] = PLAN_SHOW[g.name] || [g.name, null, 'var(--grey)'];
+    const income = !g.group;                                     // a Goal outside the portfolio is a yearly income target
+    const reached = g.gap_thb != null && g.gap_thb <= 0;
+    const lag = g.deposits_plan_ytd == null ? null : g.deposits_ytd - g.deposits_plan_ytd;
+    const row = (k, v, cls = '') => h('div', {class: 'plan-row'}, h('span', null, k), h('b', {class: cls}, v));
+    const card = h('article', {class: `card plan-goal ${compact ? 'compact' : ''}`},
+      h('div', {class: 'card-head'}, h('h3', {class: 'card-title'}, h('span', {class: 'dot', style: `background: ${colour}`}), label),
+        income ? h('span', {class: 'chip'}, 'income target') : null),
+      h('div', {class: 'goal-now', title: g.as_of ? `as of ${fmtDay(g.as_of)}` : null}, h('b', null, g.actual_thb == null ? '—' : baht(g.actual_thb)), h('span', null, `of ${baht(g.goal_thb)}`)),
+      meter(g.progress),
+      h('div', {class: 'plan-rows'},
+        g.gap_thb == null ? null : row(reached ? 'Above target' : 'To go', baht(Math.abs(g.gap_thb)), reached ? 'up' : ''),
+        g.monthly_thb ? row(income ? 'Aimed per month' : 'Reinvest plan', `${baht(g.monthly_thb)} / mo`) : null,
+        g.deposits_plan_ytd == null ? null : row(`Deposits to ${MONTHS[Number(t.month.slice(5, 7)) - 1]}`, `${baht(g.deposits_ytd)} of ${baht(g.deposits_plan_ytd)}`, lag < 0 ? 'warn-text' : 'up'),
+        g.growth_pct && !compact ? row('Planned growth', signedPct(g.growth_pct)) : null,
+        income && g.actual_thb != null ? row('Counted as', 'profit for dividend') : null),
+      g.note && !compact ? h('p', {class: 'plan-note'}, g.note) : null);
+    if (page) { card.classList.add('link'); card.tabIndex = 0; card.title = `Open ${label}`; card.addEventListener('click', () => go(page)); }
+    return card;
+  };
+  return [...t.items].sort((a, b) => planOrder(a) - planOrder(b)).map((g) => goalCard(g));
+}
+
+// ---------------------------------------------------------------- Plan: how the money moves, and the goal behind the plan
+// Income (Salary, Investment, Online Shop) pays the Spending (Fixed costs, Expenses) and feeds Investment (Stock + Trading), whose
+// return comes back as Income. The goal: that return alone pays the Spending, so Salary is no longer needed.
+// Every amount in the picture is the Cash flow log's average month of the year so far; the goal bar is a planning figure (the
+// Investment value at the plan's yearly yields), and says so.
+function financeFlowCard(f) {
+  const line = (label, value, note) => h('div', {class: 'flow-line'}, h('span', null, label, note ? h('i', null, note) : null), h('b', null, baht(value)));
+  const pctOf = (v) => `${Math.round(v * 100)}%`;
+  const pct1 = (v) => `${Math.round(v * 1000) / 10}%`;
+  const y = f.yields, put = f.reinvest;
+  const saved = (text) => { toast(text || 'Saved.'); go('plan'); };
+
+  // Investment: the yields the plan counts on, and what goes in each month
+  const editInvest = () => openForm({
+    title: 'Investment: what the plan counts on',
+    values: {stock: Math.round(y.stock * 1000) / 10, trading: Math.round(y.trading * 1000) / 10,
+      in_stock: put.planned.includes('stock') ? put.stock : null, in_trading: put.planned.includes('trading') ? put.trading : null, freed: put.freed},
+    fields: [{key: 'stock', label: 'Stock yield', type: 'number', required: true, hint: '% of its value in a year'},
+      {key: 'trading', label: 'Trading yield', type: 'number', required: true, hint: '% of its value in a year'},
+      {key: 'in_stock', label: 'Reinvest into Stock, per month', type: 'number', placeholder: `${baht(put.logged.stock)} (the Cash flow log’s average)`, hint: 'blank = the log’s average'},
+      {key: 'in_trading', label: 'Reinvest into Trading, per month', type: 'number', placeholder: `${baht(put.logged.trading)} (the Cash flow log’s average)`, hint: 'blank = the log’s average'},
+      {key: 'freed', label: 'When a debt is paid off, reinvest its payment too', type: 'check'}],
+    submit: async (v) => {
+      await api('PUT', '/api/plan/yields', {stock: (v.stock || 0) / 100, trading: (v.trading || 0) / 100});
+      await api('PUT', '/api/plan/reinvest', {stock: v.in_stock, trading: v.in_trading, freed: Boolean(v.freed)});
+      saved();
+    },
+  });
+
+  // Income and Spending show the log's average month; rows typed here replace it, to try a plan.
+  const editBox = (box, title, groups, hint) => () => {
+    const dialog = $('#dialog'), error = h('div', {class: 'form-error'}), body = h('tbody');
+    const addRow = (r) => {
+      const group = h('select', null, groups.map((g) => h('option', {value: g}, g)));
+      group.value = r.group;
+      const name = h('input', {type: 'text', placeholder: 'e.g. Salary'});
+      name.value = r.name || '';
+      const row = h('tr', null, h('td', null, group), h('td', null, name), h('td', null, numberInput(r.amount, {placeholder: '0'})),
+        h('td', null, h('button', {type: 'button', class: 'btn small ghost', title: 'Remove row', onclick: () => row.remove()}, '×')));
+      body.append(row);
+    };
+    f.rows[box].forEach(addRow);
+    const read = () => [...body.children].map((tr) => ({group: tr.querySelector('select').value, name: tr.querySelector('input').value.trim(),
+      amount: numberOf(tr.querySelectorAll('input')[1]) || 0})).filter((r) => r.name);
+    const save = async (rows) => {
+      try { await api('PUT', '/api/plan/flow', {box, rows}); dialog.close(); saved('Saved. The Cash flow log is unchanged.'); }
+      catch (e) { error.textContent = e.message; }
+    };
+    const form = h('form', {class: 'form', method: 'dialog'}, h('h2', null, title),
+      h('p', {class: 'note'}, `Monthly figures for planning. They replace the Cash flow log’s average in this box; the log itself is not changed. ${hint}`),
+      h('table', {class: 'plan-edit'}, h('thead', null, h('tr', null, h('th', null, 'Type'), h('th', null, 'Name'), h('th', null, 'Per month'), h('th'))), body),
+      h('div', null, h('button', {type: 'button', class: 'btn small', onclick: () => addRow({group: groups[0], name: '', amount: null})}, '+ Add row')),
+      error,
+      h('div', {class: 'form-buttons'},
+        f.planned.includes(box) ? h('button', {type: 'button', class: 'btn', onclick: () => save(null)}, 'Back to the log') : null,
+        h('button', {type: 'button', class: 'btn', onclick: () => dialog.close()}, 'Cancel'),
+        h('button', {type: 'submit', class: 'btn dark'}, 'Save')));
+    form.addEventListener('submit', (event) => { event.preventDefault(); const rows = read(); if (!rows.length) { error.textContent = 'Add at least one row.'; return; } save(rows); });
+    dialog.replaceChildren(form);
+    dialog.style.width = 'min(620px, calc(100vw - 32px))';
+    dialog.showModal();
+  };
+  const editIncome = editBox('income', 'Income per month, for the plan', ['Active', 'Investment', 'Other'],
+    'Everything except Salary and the Investment rows counts as income that goes on without the job.');
+  const editSpending = editBox('spending', 'Spending per month, for the plan', ['Fixed costs', 'Expenses'], 'A debt’s payment is not listed here: it is set in the Debt box.');
+  const boxHead = (label, onEdit, box) => h('div', {class: 'flow-box-head'}, h('span', {class: 'flow-cap'}, label),
+    h('button', {type: 'button', class: 'btn small ghost', onclick: onEdit}, f.planned.includes(box) ? 'Edit · planned' : 'Edit'));
+  const boxLines = (items) => items.map((l) => line(l.label, l.amount, l.detail));
+
+  // ---- Debt: reducing-balance loans. The payment is the Debt line of Spending, and it ends when the loan is paid off.
+  const putDebts = async (list) => { await api('PUT', '/api/plan/debts', {debts: list}); };
+  const asInput = (d) => ({name: d.name, line: d.line, balance: d.typed_thb, as_of: d.as_of, rate: d.rate, payment: d.payment_thb});
+  const editDebt = (index) => () => {
+    const d = index == null ? null : f.debts[index];
+    const lines = [...new Set([...f.fixed_lines, ...(d && d.line ? [d.line] : [])])];
+    openForm({
+      title: d ? `Edit — ${d.name}` : 'Add — debt',
+      values: d ? {name: d.name, balance: d.typed_thb, as_of: d.as_of, rate: Math.round(d.rate * 10000) / 100, payment: d.payment_thb, line: d.line}
+        : {as_of: today().slice(0, 7), line: lines.find((n) => /debt|loan|หนี้|ผ่อน/i.test(n)) || ''},
+      fields: [{key: 'name', label: 'Name', type: 'text', required: true, placeholder: 'House debt'},
+        {key: 'balance', label: 'Still owed', type: 'number', required: true, hint: 'the principal left, from the bank’s statement'},
+        {key: 'as_of', label: 'Balance as of', type: 'text', required: true, placeholder: '2026-10', hint: 'year-month; the dashboard pays it down from the next month'},
+        {key: 'rate', label: 'Interest', type: 'number', required: true, hint: '% a year, charged on what is still owed'},
+        {key: 'payment', label: 'Payment per month', type: 'number', required: true},
+        {key: 'line', label: 'Its line in the Cash flow log', type: 'select', options: [['', '(not in the log)'], ...lines.map((n) => [n, `Fixed costs › ${n}`])],
+          hint: 'moved out of Fixed costs so it is not counted twice'}],
+      extra: d ? [{label: 'Delete', class: 'btn danger', onclick: async () => { await putDebts(f.debts.filter((_, i) => i !== index).map(asInput)); saved('Deleted.'); }}] : [],
+      submit: async (v) => {
+        const item = {name: v.name, line: v.line || '', balance: v.balance, as_of: v.as_of, rate: (v.rate || 0) / 100, payment: v.payment};
+        const list = f.debts.map(asInput);
+        if (d) list[index] = item; else list.push(item);
+        await putDebts(list);
+        saved();
+      },
+    });
+  };
+  const debtCard = (d, index) => {
+    const top = Math.max(d.balance_thb, ...d.years.map((yr) => yr.balance_thb), 1);
+    const bar = (label, value, cls = '') => h('div', {class: `debt-year ${cls}`, title: `${label}: ${baht(value)}`},
+      h('span', {class: 'debt-amount'}, value ? shortBaht(value).replace('฿', '') : '0'),
+      h('span', {class: 'debt-bar'}, h('i', {style: `height: ${Math.max(2, (value / top) * 100)}%`})), h('span', {class: 'debt-label'}, label));
+    return h('div', {class: 'debt'},
+      h('div', {class: 'debt-head'}, h('b', null, d.name), h('span', {class: 'muted'}, `${pct1(d.rate)} a year, on what is still owed`),
+        h('button', {type: 'button', class: 'btn small', onclick: editDebt(index)}, 'Edit')),
+      h('div', {class: 'facts'},
+        planFact('Still owed', baht(d.balance_thb), d.rolled ? `estimated from ${baht(d.typed_thb)} in ${monthLabel(d.as_of)}` : `as of ${monthLabel(d.as_of)}`),
+        planFact('Payment', `${baht(d.payment_thb)} / mo`, d.principal_thb == null ? null : `interest ${baht(d.interest_thb)} · principal ${baht(d.principal_thb)}`),
+        d.never ? planFact('Paid off', 'never', `the payment does not cover the interest of ${baht(d.interest_thb)} a month`, 'down')
+          : planFact('Paid off', d.paid_off ? monthLabel(d.paid_off) : 'now', d.paid_off ? `${d.months_left} payments left${d.paid_off_age ? ` · age ${d.paid_off_age}` : ''}` : null),
+        d.never || !d.paid_off ? null : planFact('Interest still to pay', baht(d.interest_left_thb), `then Spending drops ${baht(d.payment_thb)} / mo`)),
+      d.years.length > 1 ? h('div', {class: 'debt-years'}, bar('now', d.balance_thb, 'now'), d.years.map((yr) => bar(String(yr.year), yr.balance_thb))) : null);
+  };
+  const debtBlock = h('div', {class: 'flow-goal'},
+    h('div', {class: 'flow-goal-head'}, h('h3', {class: 'card-title'}, 'Debt', h('span', {class: 'tile-abbr'}, f.debts.length ? `${baht(f.debt_thb)} still owed` : 'none entered')),
+      h('button', {type: 'button', class: 'btn small add', onclick: editDebt(null)}, '+ Add debt')),
+    f.debts.length ? f.debts.map(debtCard)
+      : h('p', {class: 'note'}, 'Add a loan (what is still owed, its interest and the monthly payment) to see when it ends and what that does to the plan.'));
+
+  // ---- the picture
+  const arrowDown = h('div', {class: 'flow-v down'}, h('span', {class: 'shaft'}),
+    h('div', null, h('b', null, baht(f.reinvest_thb)), h('span', null, put.planned.length ? 'Reinvest · planned' : 'Reinvest')));
+  const arrowUp = h('div', {class: 'flow-v up'}, h('span', {class: 'shaft'}),
+    h('div', null, h('b', null, baht(f.income.investment)), h('span', null, f.income.investment ? 'Return taken as income' : 'Return taken as income: none yet')));
+  const covered = f.coverage == null ? null : Math.min(1, Math.max(0, f.coverage));
+  const span = f.months ? `${f.months} month${f.months > 1 ? 's' : ''} of ${f.year}` : `${f.year}`;
+  const mix = (needed) => {      // a needed value split the way Stock and Trading are split today
+    const total = f.investment.total, part = (v) => shortBaht(needed * v / total).replace('฿', '');
+    return total ? h('span', {class: 'fact-split'}, `Stock ${part(f.investment.stock)} · Trading ${part(f.investment.trading)}`) : null;
+  };
+  const need = (label, needed, sub) => h('div', {class: 'fact'}, h('span', {class: 'fact-label'}, label),
+    h('div', {class: 'fact-row'}, h('b', null, shortBaht(needed)), mix(needed)), h('span', {class: 'fact-sub'}, sub));
+  const reach = f.reach;
+  const reachChip = !f.spending_thb ? null : h('span', {class: 'chip line'},
+    !reach ? 'not within 40 years at this pace' : reach.months === 0 ? 'covered today' : `at this pace: ${monthLabel(reach.month)}${reach.age ? ` · age ${reach.age}` : ''}`);
+  const chart = h('div', {class: 'chart'});
+  if (f.projection.length > 1) {
+    requestAnimationFrame(() => lineChart(chart, f.projection.map((p) => ({...p, month: `${p.year}-12`})),
+      [{key: 'return_thb', name: 'Investment returns / mo', color: 'var(--up)', width: 2.5}, {key: 'gap_thb', name: 'It has to pay / mo', color: 'var(--tan)', dash: '4 4', width: 1.5}],
+      {format: baht, axisFormat: shortBaht, xLabel: (r) => String(r.year), xAnchor: 'fit',
+        extra: (r) => [['Investment', baht(r.investment_thb)], f.debts.length ? ['Debt left', baht(r.debt_thb)] : null, r.age ? ['Age', String(r.age)] : null]}));
+  }
+
+  return h('article', {class: 'card flow-card'},
+    h('div', {class: 'card-head'}, h('h2', {class: 'caps'}, 'Finance plan'), h('span', {class: 'chip'}, f.months ? `average month · ${span}` : 'no Cash flow entries yet')),
+    h('div', {class: 'flow'},
+      h('div', {class: 'flow-box income'}, boxHead('Income', editIncome, 'income'), h('div', {class: 'flow-total'}, baht(f.income_thb)),
+        boxLines(f.income_lines)),
+      h('div', {class: 'flow-h'}, h('b', null, baht(f.spending_thb)), h('span', {class: 'shaft'}), h('span', null, f.income_thb ? `${pctOf(f.spending_thb / f.income_thb)} of income` : 'pays for')),
+      h('div', {class: 'flow-box spend'}, boxHead('Spending', editSpending, 'spending'), h('div', {class: 'flow-total'}, baht(f.spending_thb)),
+        boxLines(f.spending_lines)),
+      h('div', {class: 'flow-v-row'}, arrowDown, arrowUp),
+      h('div', null),
+      h('div', {class: 'flow-left'}, h('span', null, 'Left after spending and reinvesting'), h('b', {class: signClass(f.free_thb)}, baht(f.free_thb)),
+        f.saved_thb ? h('span', null, `after ${baht(f.saved_thb)} into Saving`) : null),
+      h('div', {class: 'flow-box invest'},
+        h('div', {class: 'flow-invest-head'}, h('div', null, h('span', {class: 'flow-cap'}, 'Investment · Stock + Trading'), h('div', {class: 'flow-total'}, baht(f.investment.total))),
+          h('button', {type: 'button', class: 'btn small ghost', onclick: editInvest}, 'Edit')),
+        h('div', {class: 'flow-invest-lines'},
+          line('Stock', f.investment.stock, `yield ${pct1(y.stock)} a year · +${baht(put.stock)}/mo`),
+          line('Trading', f.investment.trading, `yield ${pct1(y.trading)} a year · +${baht(put.trading)}/mo`)))),
+
+    debtBlock,
+
+    h('div', {class: 'flow-goal'},
+      h('div', {class: 'flow-goal-head'}, h('h3', {class: 'card-title'}, 'The goal: Investment pays for the spending, without Salary'), reachChip),
+      h('div', {class: 'meter green'}, h('div', {class: 'bar'}, h('span', {style: `width: ${(covered || 0) * 100}%`})), h('b', null, f.coverage == null ? '—' : pctOf(f.coverage))),
+      h('div', {class: f.needed_after_thb != null && f.debt_free ? 'facts two' : 'facts'},
+        planFact('Investment has to pay', `${baht(f.gap_thb)} / mo`,
+          f.goes_on_thb ? `Spending ${baht(f.spending_thb)} − ${baht(f.goes_on_thb)} income without the job` : 'all of Spending, once Salary stops'),
+        planFact('Investment would return', `${baht(f.expected_return_thb)} / mo`, `today’s value at the plan’s yields`),
+        f.needed_thb == null ? null : need('Investment needed', f.needed_thb, `Return: ${baht(f.gap_thb)}/mo`),
+        f.needed_after_thb == null || !f.debt_free ? null
+          : need('Needed once the debt is paid', f.needed_after_thb, `from ${monthLabel(f.debt_free.month)} · Return: ${baht(f.gap_after_thb)}/mo`)),
+      f.projection.length > 1 ? h('div', {class: 'flow-chart'}, h('div', {class: 'flow-chart-head'}, h('span', null, 'Projection, year end'),
+        h('span', {class: 'spend-legend'}, h('span', null, h('i', {style: 'background: var(--up)'}), 'Investment returns / mo'), h('span', null, h('i', {style: 'background: var(--tan)'}), 'It has to pay / mo'))), chart) : null,
+      h('p', {class: 'note'}, `A planning figure, not a result. It counts on Stock returning ${pct1(y.stock)} and Trading ${pct1(y.trading)} every year, on ${baht(f.reinvest_thb)} a month going in`
+        + `${put.freed && f.debts.length ? ' (plus a debt’s payment once it is paid off)' : ''}, and on spending staying where it is${f.debts.length ? ' apart from the debt ending' : ''}. `
+        + `${f.covered_year ? `Measured by the plan sheet’s year-end Goals instead: ${f.covered_year}. ` : ''}`
+        + `Recorded as income from Investment so far: ${baht(f.income.investment)} a month (${f.actual_coverage == null ? '—' : pctOf(f.actual_coverage)} of spending).`)));
+}
+
+// this year's target for the Plan page: a ring, the target, and what is left
+function planYearRing(t, goals = null) {
+  const share = Math.min(1, Math.max(0, t.progress || 0)), R = 50, C = 2 * Math.PI * R, asOf = monthLabel(t.month);
+  const id = `ring-${Math.random().toString(36).slice(2, 8)}`;
+  const grad = svg('linearGradient', {id, x1: 0, y1: 0, x2: 1, y2: 1});
+  [[0, '#a6dcc0'], [.55, '#4fb987'], [1, '#2f9e6e']].forEach(([o, c]) => grad.append(svg('stop', {offset: o, 'stop-color': c})));
+  const ring = svg('svg', {viewBox: '0 0 128 128', class: 'ring', role: 'img', 'aria-label': `${Math.round(share * 100)}% of the ${t.year} target`},
+    svg('defs', null, grad),
+    svg('circle', {cx: 64, cy: 64, r: R, fill: 'none', stroke: '#ecece9', 'stroke-width': 11}),
+    svg('circle', {cx: 64, cy: 64, r: R, fill: 'none', stroke: `url(#${id})`, 'stroke-width': 11, 'stroke-linecap': 'round',
+      'stroke-dasharray': `${C * share} ${C}`, transform: 'rotate(-90 64 64)'}));
+  const row = (k, v, sub, cls = '') => h('div', {class: 'plan-row'}, h('span', null, k, sub ? h('i', null, sub) : null), h('b', {class: cls}, v));
+  const behind = t.expected_thb == null ? null : t.actual_thb - t.expected_thb;
+  return h('article', {class: 'card plan-year'},
+    h('div', {class: 'card-head'}, h('h2', {class: 'caps'}, `${t.year} target`), h('span', {class: 'chip'}, t.months_left ? `${planSpan(t.months_left)} left` : 'year end')),
+    h('div', {class: 'ring-wrap'}, ring, h('div', {class: 'ring-center'}, h('b', null, t.progress == null ? '—' : `${Math.round(t.progress * 100)}%`), h('span', null, 'of target'))),
+    h('div', {class: 'plan-year-value'}, baht(t.target_thb)),
+    h('div', {class: 'note', style: 'text-align: center'}, `Total Portfolio Value by Dec ${t.year}`),
+    h('div', {class: 'plan-rows roomy'},
+      row('Now', baht(t.actual_thb), `end of ${asOf}`),
+      row(t.gap_thb > 0 ? 'To go' : 'Above target', baht(Math.abs(t.gap_thb))),
+      t.per_month_thb != null && t.gap_thb > 0 ? row('Needed per month', baht(t.per_month_thb)) : null,
+      behind == null ? null : row('Straight-line pace', `${behind < 0 ? '−' : '+'}${baht(Math.abs(behind))}`, behind < 0 ? 'behind' : 'ahead', behind < 0 ? 'warn-text' : 'up')),
+    t.stale.length ? h('p', {class: 'note'}, `Carried forward from an earlier month: ${t.stale.join(', ')}.`) : null,
+    goals ? h('div', {class: 'plan-year-goals'}, h('h3', {class: 'card-title'}, `${t.year}, Goal by Goal`),
+      h('span', {class: 'note'}, 'Value now against the year’s Goal, and deposits recorded against the monthly plan.'),
+      h('div', {class: 'plan-goals stacked'}, goals)) : null);
+}
+
+// ---------------------------------------------------------------- the year's progress bars at the top of a page
+// specs: [{name, label}] where name is a Goal name (Stock, Trading, Saving Cash, Saving Bitcoin, OnTheWall). The box fills in once the
+// figures arrive and is left out when the year has no Goal for any of them. 
+function goalStrip(year, specs) {
+  const box = h('article', {class: 'card goal-strip', hidden: true});
+  const bar = (label, actual, goal, note) => {
+    const share = goal ? Math.min(1, Math.max(0, actual / goal)) : 0;
+    return h('div', {class: 'gs-row', title: note || null},
+      h('span', {class: 'gs-label'}, label),
+      h('div', {class: 'gs-track'}, h('span', {style: `width: ${share * 100}%`})),
+      h('span', {class: 'gs-nums'}, h('b', null, baht(actual)), ` / ${baht(goal)}`),
+      h('b', {class: 'gs-pct'}, goal ? `${Math.round(actual / goal * 100)}%` : '—'));
+  };
+  api('GET', `/api/goal-bars${year ? `?year=${year}` : ''}`).then((res) => {
+    const rows = [];
+    for (const {name, label} of specs) {
+      const b = res.bars[name];
+      if (!b || !b.goal_thb) continue;                           // no Goal that year
+      rows.push(bar(label, b.actual_thb, b.goal_thb, b.as_of ? `as of ${fmtDay(b.as_of)}` : null));
+    }
+    if (!rows.length) return;
+    box.replaceChildren(...rows);
+    box.hidden = false;
+  }).catch(() => { /* the page itself still works without the bars */ });
+  return box;
+}
+
 const pages = {
   async home(host) {
     const d = await api('GET', '/api/home');
     const k = d.kpis;
     setChips(k);
-    if (!k) { host.append(h('article', {class: 'card'}, h('p', {class: 'note'}, 'No values recorded yet. Run scripts/import_fund_management.py, or add values under Investment.'))); return; }
-    host.append(h('div', {class: 'tiles'},
-      tile('Total Portfolio Value', baht(k.total), k.total_mom),
-      tile('Monthly Return', baht(k.monthly_return), k.monthly_return_pct, k.monthly_return),
-      tile('Investment', baht(k.investment), k.investment_mom),
-      tile('Trading', baht(k.trading_pnl), k.trading_pnl_pct, k.trading_pnl),
-      tile('SHOP Revenue', d.shop.available ? baht(k.shop_revenue) : '—', k.shop_mom)));
+    if (!k) { host.append(h('article', {class: 'card'}, h('p', {class: 'note'}, 'No values recorded yet. Run scripts/import_fund_management.py, or add values under Stock.'))); return; }
+    // the big figure is green when the month is up and stays black when it is down (the % and baht beside it carry the red)
+    const upOnly = (v) => (v > 0 ? v : 0);
+    const linked = (el, page, label) => { el.classList.add('link'); el.tabIndex = 0; el.title = `Open ${label}`;
+      el.addEventListener('click', () => go(page)); el.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(page); }); return el; };
+    // Total Portfolio Value; its Monthly Return (the change in value, deposits counted) follows the MoM %
+    const totalTile = h('article', {class: 'card tile-total'},
+      h('div', {class: 'tile-label'}, 'Total Portfolio Value'),
+      h('div', {class: `tile-value ${k.total_mom > 0 ? 'up' : ''}`}, baht(k.total)),
+      h('div', {class: 'tile-sub'}, h('span', {class: `delta ${signClass(k.total_mom)}`}, signedPct(k.total_mom)),
+        h('b', {class: `tile-return-val ${signClass(k.monthly_return)}`, title: 'Monthly Return'}, baht(k.monthly_return)), h('span', null, 'MoM')));
+    // the Trading tile shows the same figure as Trading › Trading Portfolio: the journal's Net Balance at the latest FX rate
+    const tj = d.trading_journal;
+    // MoM is the journal's move since the previous month end (P&L so far this month), in baht at the same FX rate
+    let tradingTile;
+    if (tj && tj.fx) {
+      tradingTile = tile('Trading Portfolio', baht(tj.value * tj.fx), tj.monthly_pct, upOnly(tj.monthly_pct), undefined, tj.monthly_amount == null ? null : tj.monthly_amount * tj.fx);
+    } else tradingTile = tile('Trading Portfolio', baht(k.trading), k.trading_mom, upOnly(k.trading_mom));
+    host.append(h('div', {class: 'tiles'}, totalTile,
+      linked(tile('Stock Portfolio', baht(k.investment), k.investment_mom, upOnly(k.investment_mom), undefined, k.investment_change), 'investment', 'Stock Portfolio'),
+      linked(tradingTile, 'trading', 'Trading Portfolio'),
+      linked(tile('Shop Revenue', d.shop.available ? baht(k.shop_revenue) : '—', k.shop_mom, upOnly(k.shop_mom), undefined, k.shop_change), 'shop', 'Online Shop'),
+      linked(tile(h('span', null, 'Saving', h('span', {class: 'tile-abbr'}, 'Saving + EMC')), baht(k.saving), k.saving_mom, upOnly(k.saving_mom), undefined, k.saving_change), 'wealth', 'Saving')));
 
     const year = k.month.slice(0, 4);   // this year, as far as the data goes
     const perf = performanceCard({year, rowsYear: d.growth_year, rowsAll: d.growth, legend: 'Total Portfolio',
@@ -875,7 +1475,8 @@ const pages = {
     const perfCard = perf.card;
 
     const donutBox = h('div', {class: 'donut'});
-    const parts = d.allocation.map((a) => ({label: GROUPS[a.group][0], value: a.value_thb, color: GROUPS[a.group][1], share: a.share, page: GROUPS[a.group][2]}));
+    const ALLOC_ORDER = ['investment', 'trading', 'emc', 'saving'];
+    const parts = [...d.allocation].sort((a, b) => ALLOC_ORDER.indexOf(a.group) - ALLOC_ORDER.indexOf(b.group)).map((a) => ({label: GROUPS[a.group][0], value: a.value_thb, color: GROUPS[a.group][1], share: a.share, page: GROUPS[a.group][2]}));
     const allocCard = h('article', {class: 'card'}, h('h2', {class: 'caps'}, 'Asset Allocation'),
       h('div', {class: 'donut-wrap'}, donutBox,
         h('div', {class: 'legend'}, parts.map((p) => h('a', {href: `#${p.page}`}, h('span', null, h('span', {class: 'dot', style: `background: ${p.color}`}), p.label), h('span', null, pct(p.share)))))),
@@ -884,52 +1485,36 @@ const pages = {
     perf.draw('return');
     donut(donutBox, parts, {pct: k.total_mom, total: k.total});
 
-    const goals = h('article', {class: 'card'}, h('div', {class: 'card-head'}, h('h2', {class: 'caps'}, 'Investment Goals'),
-      h('button', {type: 'button', class: 'btn small', onclick: () => go('plan')}, 'Edit')),
-      h('div', {class: 'goals'}, d.goals.length ? d.goals.map((g) => h('div', null,
-        h('div', {class: 'goal-top'}, h('span', {class: 'goal-name'}, GROUPS[g.bucket] ? GROUPS[g.bucket][0] : 'Wealth'), h('span', null, `${baht(g.actual_thb)} of ${baht(g.goal_thb)}`)),
-        h('div', {class: 'goal-sub'}, h('span', null, `Target: Dec ${g.year}`)),
-        h('div', {class: 'mini'}, h('div', {class: 'bar'}, h('span', {style: `width: ${Math.min(1, Math.max(0, g.progress || 0)) * 100}%`})), h('span', null, `${Math.round((g.progress || 0) * 100)}%`))))
-        : h('p', {class: 'note'}, 'No Goals for this year yet.')));
-    const upcoming = crud({
-      title: 'Upcoming', caps: true, resource: 'upcoming', query: '?open=1',
-      defaults: () => ({due_date: today(), kind: 'Bill'}),
-      columns: [
-        {key: 'due_date', label: 'Due', type: 'date', required: true, cls: 'nowrap'},
-        {key: 'item', label: 'Item', type: 'text', required: true},
-        {key: 'kind', label: 'Kind', type: 'select', options: ['Bill', 'Dividend', 'Restock', 'Rebalance', 'Entry', 'Other'].map((v) => [v, v]), table: false},
-        {key: 'amount_thb', label: 'Amount', type: 'money', cls: 'r'},
-        {key: 'done', label: 'Done', type: 'check', table: false},
-      ],
-    });
-    const projects = crud({
-      title: 'Ongoing Projects', caps: true, resource: 'projects',
-      columns: [
-        {key: 'name', label: 'Project', type: 'text', required: true},
-        {key: 'track', label: 'Track', type: 'text', table: false},
-        {key: 'status', label: 'Status', type: 'text', table: false},
-        {key: 'progress', label: 'Progress', type: 'number', hint: '0 to 1',
-          show: (r) => h('div', {class: 'mini'}, h('div', {class: 'bar'}, h('span', {style: `width: ${Math.min(1, Math.max(0, r.progress)) * 100}%`})), h('span', null, `${Math.round(r.progress * 100)}%`))},
-        {key: 'next_step', label: 'Next step', type: 'text', table: false},
-      ],
-    });
-    host.append(h('div', {class: 'row3'}, goals, upcoming, projects));
+    // this year's target on the left, and the year Goal by Goal on the right (both from the Plan page)
+    let plan = null;
+    try { plan = (await api('GET', '/api/plan')).this_year || null; } catch (e) { /* the rest of Home still loads */ }
+    if (plan) {
+      host.append(h('div', {class: 'plan-home'}, planYearCard(plan, true),
+        h('article', {class: 'card'}, h('div', {class: 'card-head'}, h('h2', {class: 'caps'}, `${plan.year} progress by asset`),
+          h('button', {type: 'button', class: 'btn small', onclick: () => go('plan')}, 'Open Plan')),
+          planGoalRows(plan))));
+    } else {
+      host.append(h('article', {class: 'card'}, h('div', {class: 'card-head'}, h('h2', {class: 'caps'}, 'Plan'), h('button', {type: 'button', class: 'btn small', onclick: () => go('plan')}, 'Open Plan')),
+        h('p', {class: 'note'}, 'No Goals for this year yet.')));
+    }
   },
 
-  async investment(host) {
-    const d = await api('GET', '/api/investment');
+  async investment(host, picked) {
+    const d = await api('GET', `/api/investment${picked ? `?year=${picked}` : ''}`);
     const st = d.stats;
     const manual = d.accounts.filter((a) => a.source === 'manual');
     const ids = new Set(manual.map((a) => a.id));
     const names = new Map(manual.map((a) => [a.id, a.name]));
     const again = () => go('investment');
-    host.append(pageHead('Investment Portfolio', 'Stock Accounts held for the long term. Values are monthly figures in THB; there is no live price feed.'));
+    host.append(pageHead('Stock Portfolio', null, d.years.length ? yearTabs('investment', d.years, d.year) : null));
+    crudYear['Stock Portfolio'] = d.year;
+    host.append(goalStrip(d.year, [{name: 'Stock', label: 'Stock'}]));
 
     // Monthly Return, YTD and CAGR are all change in value with deposits counted, like the chart below.
     host.append(h('div', {class: 'tiles'}, ...accountCards(d.accounts).children, ...bucketStatTiles(st)));
 
-    const perf = performanceCard({year: st ? st.month.slice(0, 4) : String(new Date().getFullYear()), rowsYear: d.growth_year, rowsAll: d.growth,
-      legend: 'Investment', nameYear: 'Investment (incl. deposits)', nameAll: 'Investment (value growth)'});
+    const perf = performanceCard({year: d.year, yearTab: st && d.year !== st.month.slice(0, 4) ? d.year : null, rowsYear: d.growth_year, rowsAll: d.growth,
+      legend: 'Stock', nameYear: 'Stock (incl. deposits)', nameAll: 'Stock (value growth)'});
     host.append(perf.card);
     perf.draw('return');
 
@@ -938,14 +1523,14 @@ const pages = {
       return [...new Set(JSON.parse(r.holdings).map((x) => marketLabel(x.market)))].join(' · ');
     };
     const portfolio = crud({
-      title: 'Investment Portfolio', resource: 'snapshots', filter: (r) => ids.has(r.account_id), onChange: again,
-      editor: (row, done) => portfolioEditor(manual, row, done),
+      title: 'Stock Portfolio', resource: 'snapshots', filter: (r) => ids.has(r.account_id), byYear: (r) => r.as_of.slice(0, 4), onChange: again,
+      editor: (row, done) => portfolioEditor(manual, row, done, d.benchmarks),
       note: 'One row per month. Add or edit it to enter the holdings by Market and Stock.',
       columns: [
         {key: 'holdings', label: 'Market', show: markets, cls: 'nowrap'},
         {key: 'as_of', label: 'Date', show: (r) => mmyy(r.as_of), cls: 'nowrap'},
         {key: 'value_thb', label: 'Value (THB)', type: 'money', cls: 'r'},
-        {key: 'note', label: 'Note', show: (r) => noteIcon(r.note, `Note — ${mmyy(r.as_of)}`)},
+        {key: 'note', label: 'Note', show: (r) => noteIcon(monthNote(r, d.benchmarks, ['SET']), `Note — ${mmyy(r.as_of)}`)},
       ],
     });
 
@@ -956,7 +1541,7 @@ const pages = {
       parts.length
         ? h('div', {class: 'donut-wrap'}, donutBox,
           h('div', {class: 'legend'}, parts.map((p) => h('div', {class: 'legend-item'}, h('span', null, h('span', {class: 'dot', style: `background: ${p.color}`}), p.label), h('span', null, pct(p.share))))))
-        : h('p', {class: 'note'}, 'No holdings by market yet. Add a month in Investment Portfolio with a Market on each row and the split appears here.'));
+        : h('p', {class: 'note'}, 'No holdings by market yet. Add a month in Stock Portfolio with a Market on each row and the split appears here.'));
     const top = d.markets.top || [];
     const topCard = h('article', {class: 'card'}, h('h2', {class: 'caps'}, 'Top 10 holdings'),
       top.length ? h('div', {class: 'table-wrap'}, h('table', null,
@@ -964,12 +1549,12 @@ const pages = {
         h('tbody', null, top.map((t, n) => h('tr', null, h('td', {class: 'muted'}, n + 1), h('td', null, t.stock || '—'), h('td', null, marketLabel(t.market)),
           h('td', {class: 'r'}, baht(t.value_thb)), h('td', {class: 'r'}, pct(t.share)))))))
         : h('p', {class: 'note'}, 'Shown once a month has holdings entered. Cash is not counted as a stock.'),
-      top.length ? h('p', {class: 'note'}, 'Share is of the whole Investment value, cash included.') : null);
+      top.length ? h('p', {class: 'note'}, 'Share is of the whole Stock value, cash included.') : null);
     host.append(h('div', {class: 'pair'}, h('div', {class: 'stack'}, marketCard, topCard), portfolio));
     if (parts.length) donut(donutBox, parts, {total: parts.reduce((t, p) => t + p.value, 0)});
 
     const flows = crud({
-      title: 'Deposits and withdrawals', resource: 'flows', filter: (r) => ids.has(r.account_id), onChange: again,
+      title: 'Deposits and withdrawals', resource: 'flows', filter: (r) => ids.has(r.account_id), byYear: (r) => r.on_date.slice(0, 4), onChange: again,
       note: 'Record every deposit (+) and withdrawal (−) in the month it happened.',
       defaults: () => ({account_id: manual[0].id, on_date: today()}),
       columns: [
@@ -980,23 +1565,15 @@ const pages = {
         {key: 'note', label: 'Note', type: 'text', show: (r) => noteIcon(r.note, `Note — ${mmyy(r.on_date)}`)},
       ],
     });
-    const benchmarks = crud({
-      title: 'Benchmark prices', resource: 'benchmarks', onChange: again,
-      note: 'Month-end closing price of the Benchmark.',
-      defaults: () => ({name: 'SET', as_of: today()}),
-      columns: [
-        {key: 'name', label: 'Benchmark', type: 'select', options: [['BTC', 'BTC'], ['SET', 'SET']], required: true},
-        {key: 'as_of', label: 'Date', type: 'date', required: true, cls: 'nowrap'},
-        {key: 'value', label: 'Close', type: 'number', required: true, cls: 'r'},
-      ],
-    });
-    host.append(h('div', {class: 'pair'}, flows, benchmarks));
+    host.append(h('div', {class: 'pair half'}, flows));
   },
 
   async trading(host, year) {
     const url = () => `/api/trading${year ? `?year=${year}` : ''}`;
     let d = await api('GET', url());
-    host.append(pageHead('Trading Portfolio', 'The trade journal is the source: the figures below come from it, in USDT, and do not include deposits or withdrawals. This system never places an order.'),
+    host.append(pageHead('Trading Portfolio', null,
+      d.sheet.years.length ? yearTabs('trading', d.sheet.years, d.sheet.year) : null),
+      goalStrip(d.sheet.year, [{name: 'Trading', label: 'Trading'}]),
       h('div', {class: 'tiles'},
         d.stats ? (d.stats.fx
           ? tile('Trading Portfolio', baht(d.stats.value * d.stats.fx), undefined, undefined, `${usdt(d.stats.value)} USDT × ${number(d.stats.fx)} (FX ${yymm(d.stats.fx_as_of)})`)
@@ -1018,6 +1595,25 @@ const pages = {
         render();
       },
     });
+    // Excel is the source of the journal: Sync Excel reads the workbook again and the trades become exactly what it holds
+    const syncButton = h('button', {type: 'button', class: 'btn small dark', onclick: async () => {
+      syncButton.disabled = true; syncButton.textContent = 'Syncing…';
+      try {
+        const out = await api('POST', '/api/journal/sync');
+        const parts = [`${out.trades} trades`, out.added ? `${out.added} new` : null, out.removed ? `${out.removed} removed` : null].filter(Boolean);
+        toast(`Synced from Excel: ${parts.join(', ')}.`);
+        go('trading', year);
+      } catch (e) { toast(e.message); syncButton.disabled = false; syncButton.textContent = 'Sync Excel'; }
+    }}, 'Sync Excel');
+    const src = d.journal_source || {};
+    const when = (iso) => (iso ? `${fmtDay(iso.slice(0, 10))} ${iso.slice(11, 16)}` : '—');
+    const sourceFoot = h('div', {class: 'source-foot'},
+      h('span', {class: `muted ${src.stale ? 'warn-text' : ''}`}, !src.exists ? `${src.file || 'The journal workbook'} was not found.`
+        : src.stale ? `Excel was saved ${when(src.saved_at)}, after the last sync${src.synced_at ? ` (${when(src.synced_at)})` : ''}. Press Sync Excel.`
+        : `In sync · last synced ${when(src.synced_at)}`),
+      h('button', {type: 'button', class: 'btn small', disabled: !src.exists, onclick: async () => {
+        try { await api('POST', '/api/journal/open'); toast('Opening Excel…'); } catch (e) { toast(e.message); }
+      }}, 'Open Excel'));
     // what each Grade means, in one row under the description; Edit changes the wording
     const gradesRow = h('div', {class: 'grade-row'});
     const drawGrades = () => gradesRow.replaceChildren(...['A', 'B', 'C'].map((g) =>
@@ -1031,24 +1627,22 @@ const pages = {
       summaryHost.replaceChildren(journalSummary(d.sheet.summary));
       grid.setRows(d.sheet.trades);
     }
-    const jYear = d.sheet.year, jYears = d.sheet.years.length ? d.sheet.years : [jYear];
-    const yearTabs = h('div', {class: 'tabs', role: 'tablist'}, jYears.map((y) =>
-      h('button', {type: 'button', role: 'tab', 'aria-selected': String(y === jYear), onclick: () => go('trading', y)}, y)));
+    const jYear = d.sheet.year;
     host.append(h('article', {class: 'card'}, h('div', {class: 'card-head'},
       h('h2', {class: 'card-title'}, 'Trade journal summary'),
-      h('span', {class: 'row-gap'}, jYears.length > 1 ? yearTabs : h('span', {class: 'chip line'}, `Year ${jYear}`), h('span', {class: 'chip'}, 'USDT'),
+      h('span', {class: 'row-gap'}, h('span', {class: 'chip line'}, `Year ${jYear}`), h('span', {class: 'chip'}, 'USDT'),
         h('button', {type: 'button', class: 'btn small', onclick: editSettings}, 'Edit Start and Risk'))), summaryHost));
 
-    const perfYear = d.growth_year.length ? d.growth_year[d.growth_year.length - 1].month.slice(0, 4) : String(new Date().getFullYear());
-    const perf = performanceCard({year: perfYear, rowsYear: d.growth_year, rowsAll: d.growth, legend: 'Trading', bench: 'BTC', title: 'Trading Portfolio', valueFmt: (v) => `${usdt(v)} USDT`,
+    const perfYear = jYear || (d.growth_year.length ? d.growth_year[d.growth_year.length - 1].month.slice(0, 4) : String(new Date().getFullYear()));
+    crudYear['Trading Portfolio'] = jYear;
+    const perf = performanceCard({year: perfYear, rowsYear: d.growth_year, rowsAll: d.growth, legend: 'Trading', bench: 'BTC', title: 'Trading Portfolio', valueFmt: (v) => `${usdt(v)} USDT`, yearTab: d.stats && jYear !== d.stats.month.slice(0, 4) ? jYear : null,
       nameYear: 'Trading (journal)', nameAll: 'Trading'});
     host.append(perf.card);
     perf.draw('return');
 
     host.append(h('article', {class: 'card'},
-      h('div', {class: 'card-head'}, h('h2', {class: 'card-title'}, 'Trade journal'),
-        h('button', {type: 'button', class: 'btn small dark', onclick: () => grid.add()}, '+ Add trade')),
-      h('p', {class: 'note'}, 'Click a cell to edit it. Enter or Tab saves, Esc cancels. Day, Balance and Risk / Trade are worked out for you; type a result in Profit or in Loss.'),
+      h('div', {class: 'card-head'}, h('h2', {class: 'card-title'}, 'Trade journal'), syncButton),
+      h('p', {class: 'note'}, 'Kept in the Excel journal: add and edit trades there, save the file, then press Sync Excel. The table below is a copy of it.'),
       gradesRow,
       h('details', {class: 'rules'}, h('summary', null, 'Setup checklist'),
         h('div', {class: 'table-wrap'}, h('table', null,
@@ -1056,7 +1650,7 @@ const pages = {
           h('tbody', null,
             h('tr', null, ['Battle Field (EMA)', 'EMA 8/26/50/99/200', 'RSI Strong · DD ไม่ขยาย · ย้ำหัวไปต่อ', 'RSI Divergence', 'Choch/Bos · ไป 2X HB', 'Passed', 'Fib 0.5 / 0.68 / 0.78', '3R · 100 of A'].map((t) => h('td', null, t))),
             h('tr', null, ['Hua Taew (Divergence)', 'RSI Div 4H', 'RSI Div · DD ขยาย · ซอยเท้า', 'RSI Divergence', 'Choch/Bos', 'Passed', 'Fib 0.5 / 0.68 / 0.78', '3R · 100 of A'].map((t) => h('td', null, t))))))),
-      grid.wrap));
+      grid.wrap, sourceFoot));
     render();
 
     // by month, from the journal: trades, P&L, P&L against the month's opening balance, and the balance at month end
@@ -1075,8 +1669,9 @@ const pages = {
     const again = () => go('trading');
     const accountOpts = manual.map((a) => [a.id, `${a.name} (${a.currency})`]);
     const monthlyValues = crud({
-      title: 'Monthly values', resource: 'snapshots', filter: (r) => ids.has(r.account_id), onChange: again,
-      note: 'Account balance at month end. For an Account not in THB, enter the FX rate used.',
+      title: 'Trading Portfolio', resource: 'snapshots', filter: (r) => ids.has(r.account_id), byYear: (r) => r.as_of.slice(0, 4), onChange: again,
+      editor: (row, done) => tradingEditor(manual, row, done, d.benchmarks),
+      note: 'Account balance at month end, with the BTC price of the month. For an Account not in THB, the FX rate used.',
       defaults: () => ({account_id: manual[0].id, as_of: today()}),
       columns: [
         {key: 'account_id', label: 'Account', type: 'select', options: accountOpts, show: (r) => (names.get(r.account_id) || {}).name || '', required: true},
@@ -1085,11 +1680,11 @@ const pages = {
           show: (r) => `${number(r.value_native)} ${(names.get(r.account_id) || {}).currency || ''}`},
         {key: 'fx_rate', label: 'FX rate', type: 'number', hint: 'THB per 1 unit; leave blank for THB', cls: 'r'},
         {key: 'value_thb', label: 'THB', type: 'money', form: false, cls: 'r'},
-        {key: 'note', label: 'Note', type: 'text', show: (r) => noteIcon(r.note, `Note — ${yymm(r.as_of)}`)},
+        {key: 'note', label: 'Note', type: 'text', show: (r) => noteIcon(monthNote(r, d.benchmarks, ['BTC']), `Note — ${yymm(r.as_of)}`)},
       ],
     });
     const deposits = crud({
-      title: 'Deposits and withdrawals', resource: 'flows', filter: (r) => ids.has(r.account_id), onChange: again,
+      title: 'Deposits and withdrawals', resource: 'flows', filter: (r) => ids.has(r.account_id), byYear: (r) => r.on_date.slice(0, 4), onChange: again,
       note: 'Record every deposit (+) and withdrawal (−) in the month it happened, or that month’s return is wrong.',
       defaults: () => ({account_id: manual[0].id, on_date: today()}),
       columns: [
@@ -1107,7 +1702,7 @@ const pages = {
     const d = await api('GET', '/api/shop/finance');
     const intro = 'Monthly profit and loss, typed here. Revenue is whole-shop sales; it is not Best’s share.';
     if (!d.available) {
-      host.append(pageHead('EMBRACE Shop', intro)); host.append(h('article', {class: 'card'}, h('p', {class: 'note warn'}, d.reason))); return; }
+      host.append(pageHead('Online Shop', intro)); host.append(h('article', {class: 'card'}, h('p', {class: 'note warn'}, d.reason))); return; }
     const years = d.years;
     // every month typed so far, for filling the editor
     const existing = {};
@@ -1123,7 +1718,7 @@ const pages = {
       return last ? (last.month === 12 ? [newest.year + 1, 1] : [newest.year, last.month + 1]) : [new Date().getFullYear(), new Date().getMonth() + 1];
     };
     if (!years.length) {
-      host.append(pageHead('EMBRACE Shop', intro));
+      host.append(pageHead('Online Shop', intro));
       host.append(h('article', {class: 'card'}, h('p', {class: 'note'}, 'No shop figures yet. Add the first month: Revenue by platform, cost of goods and fees.'),
         h('div', null, h('button', {type: 'button', class: 'btn dark', onclick: () => openEditor(...nextMonth())}, '+ Add month'))));
       return;
@@ -1137,19 +1732,58 @@ const pages = {
 
     const tabs = h('div', {class: 'tabs', role: 'tablist'}, years.map((x) =>
       h('button', {type: 'button', role: 'tab', 'aria-selected': String(x.year === y.year), onclick: () => go('shop', x.year)}, String(x.year))));
-    host.append(h('div', {class: 'page-head'}, h('h2', {class: 'page-title'}, 'EMBRACE Shop'), tabs));
+    host.append(h('div', {class: 'page-head'}, h('h2', {class: 'page-title'}, 'Online Shop'), tabs), goalStrip(y.year, [{name: 'OnTheWall', label: 'Online Shop'}]));
 
+    // each tile: the year so far, then the latest month against the one before it (the same % + baht + MoM as the other pages)
+    const mom = (list, get, costly = false) => {
+      const [prev, cur] = list.slice(-2);
+      if (!prev || !cur || !get(prev)) return null;
+      const diff = get(cur) - get(prev), good = costly ? -diff : diff;
+      return h('div', {class: 'tile-sub'}, h('span', {class: `delta ${signClass(good)}`}, signedPct(diff / get(prev))),
+        h('b', {class: `tile-return-val ${signClass(good)}`}, baht(diff)), h('span', null, `MoM · ${MONTHS[cur.month - 1]}`));
+    };
+    const netOf = (m) => m.net_profit || 0;                      // as the shop sheet does it: revenue - cost of goods - fees - interest and tax
+    const net = sum(mm, netOf);
+    const latest = mm[mm.length - 1] || {};                       // the latest month with data
+    const avg = mm.length ? net / mm.length : 0;                  // the average month of the year so far, the latest included
+    const vsAvg = avg ? h('div', {class: 'tile-sub'}, h('span', {class: `delta ${signClass(netOf(latest) - avg)}`}, signedPct((netOf(latest) - avg) / Math.abs(avg))),
+      h('b', {class: `tile-return-val ${signClass(netOf(latest) - avg)}`}, baht(netOf(latest) - avg)), h('span', null, 'vs Avg Profit')) : null;
+    // against the same months of the year before (Jan to the latest month), so a part year is not set against a whole one
+    const before = years.find((x) => x.year === y.year - 1);
+    const lastYear = before ? before.months.filter((m) => m.manual && m.month <= (latest.month || 0)) : [];
+    const netBefore = sum(lastYear, netOf);
+    const yoy = lastYear.length && netBefore ? h('div', {class: 'tile-sub'}, h('span', {class: `delta ${signClass(net - netBefore)}`}, signedPct((net - netBefore) / Math.abs(netBefore))),
+      h('b', {class: `tile-return-val ${signClass(net - netBefore)}`}, baht(net - netBefore)), h('span', null, 'YOY')) : null;
     host.append(h('div', {class: 'tiles'},
-      h('article', {class: 'card'}, h('div', {class: 'tile-label'}, `Revenue ${y.year}`), h('div', {class: 'tile-value'}, baht(ytd)), h('div', {class: 'tile-sub'}, `${mm.length} months with data`)),
-      h('article', {class: 'card'}, h('div', {class: 'tile-label'}, 'Fees, shipping and ads'), h('div', {class: 'tile-value'}, baht(fees)), h('div', {class: 'tile-sub'}, ytd ? `${(fees / ytd * 100).toFixed(1)}% of revenue` : '')),
-      h('article', {class: 'card'}, h('div', {class: 'tile-label'}, 'After fees'), h('div', {class: 'tile-value'}, baht(ytd - fees)), h('div', {class: 'tile-sub'}, 'before cost of goods')),
-      h('article', {class: 'card'}, h('div', {class: 'tile-label'}, 'Cost of goods (COGS)'), h('div', {class: 'tile-value'}, cogs ? baht(cogs) : '–'), h('div', {class: 'tile-sub'}, cogs ? '' : 'not entered'))));
+      h('article', {class: 'card'}, h('div', {class: 'tile-label'}, `Revenue ${y.year}`), h('div', {class: 'tile-value'}, baht(ytd)), mom(mm, (m) => m.revenue), h('div', {class: 'tile-sub'}, `${mm.length} months with data`)),
+      h('article', {class: 'card'}, h('div', {class: 'tile-label'}, (latest.month ? `Net Profit · ${MONTHS[latest.month - 1]}` : 'Net Profit')), h('div', {class: `tile-value ${netOf(latest) > 0 ? 'up' : ''}`}, baht(netOf(latest))), vsAvg, h('div', {class: 'tile-sub'}, `current Avg Profit ${baht(avg)}${latest.has_cogs ? '' : ' · cost of goods not entered'}`)),
+      h('article', {class: 'card'}, h('div', {class: 'tile-label'}, 'Fees, shipping and ads'), h('div', {class: 'tile-value'}, baht(fees)), mom(mm, (m) => m.sga, true), h('div', {class: 'tile-sub'}, ytd ? `${(fees / ytd * 100).toFixed(1)}% of revenue` : '')),
+      h('article', {class: 'card'}, h('div', {class: 'tile-label'}, `Net Profit ${y.year}`), h('div', {class: `tile-value ${net > 0 ? 'up' : ''}`}, baht(net)), yoy, h('div', {class: 'tile-sub'}, `${mm.length} months so far${cogs ? '' : ' · cost of goods not entered'}`))));
 
     if (mm.length) {
+      // columns: Revenue of each month; lines: Profit added up month by month, and the year before's as the benchmark
+      const lastManual = mm[mm.length - 1].month;
+      const before = years.find((x) => x.year === y.year - 1);
+      let cum = 0, cumBefore = 0;
+      const rows = Array.from({length: lastManual}, (_, i) => {
+        const cur = by[i + 1], old = before && before.months.find((m) => m.month === i + 1);
+        if (cur && cur.manual) cum += netOf(cur);
+        if (old && old.manual) cumBefore += netOf(old);
+        return {month: `${y.year}-${String(i + 1).padStart(2, '0')}`, revenue: cur && cur.manual ? cur.revenue : null,
+          profit: cur && cur.manual ? cum : null, before: old && old.manual ? cumBefore : null};
+      });
+      const hasBefore = rows.some((r) => r.before != null);
       const chart = h('div', {class: 'chart'});
-      host.append(h('article', {class: 'card'}, h('h2', {class: 'card-title'}, 'Revenue by month'), chart));
-      lineChart(chart, mm.map((m) => ({month: `${y.year}-${String(m.month).padStart(2, '0')}`, revenue: m.revenue})),
-        [{key: 'revenue', name: 'Revenue', color: 'var(--up)'}], {format: baht});
+      host.append(h('article', {class: 'card'},
+        h('div', {class: 'card-head'}, h('h2', {class: 'card-title'}, 'Revenue and cumulative profit'),
+          h('div', {class: 'spend-legend'},
+            h('span', null, h('i', {style: 'background: #dededa; border-radius: 2px'}), 'Revenue'),
+            h('span', null, h('i', {style: 'background: var(--up)'}), `Cumulative Profit ${y.year}`),
+            hasBefore ? h('span', null, h('i', {style: 'background: var(--grey)'}), `Benchmark ${y.year - 1}`) : null)),
+        chart));
+      lineChart(chart, rows, [{key: 'profit', name: `Cumulative Profit ${y.year}`, color: 'var(--up)', width: 2.5},
+        ...(hasBefore ? [{key: 'before', name: `Benchmark ${y.year - 1}`, color: 'var(--grey)', dash: '5 4', width: 1.8}] : [])],
+        {format: baht, axisFormat: shortBaht, bars: {key: 'revenue', name: 'Revenue', color: '#dededa'}});
     }
 
     const dash = () => h('td', {class: 'r muted'}, '–');
@@ -1166,8 +1800,8 @@ const pages = {
         h('td', {class: 'r'}, opt.noTotal ? '' : h('b', null, vals.length ? fmt(vals.reduce((a, b) => a + b, 0)) : '–')));
     };
     const lines = (key) => names(key).map((n) => row(n, (m) => (n in m[key] ? m[key][n] : null), {indent: true}));
-    host.append(h('article', {class: 'card'}, h('div', {class: 'card-head'}, h('h2', {class: 'card-title'}, `Month by month ${y.year}`),
-      h('button', {type: 'button', class: 'btn small', onclick: () => openEditor(...nextMonth())}, '+ Add')), h('div', {class: 'table-wrap fit'}, h('table', null,
+    host.append(h('article', {class: 'card'}, h('div', {class: 'card-head'}, h('h2', {class: 'card-title'}, mm.length ? `Monthly profit and loss · ${MONTHS[mm[0].month - 1]}${mm.length > 1 ? `–${MONTHS[mm[mm.length - 1].month - 1]}` : ''} ${y.year}` : `Monthly profit and loss · ${y.year}`),
+      h('button', {type: 'button', class: 'btn small add', onclick: () => openEditor(...nextMonth())}, '+ Add')), h('div', {class: 'table-wrap fit'}, h('table', null,
       h('thead', null, h('tr', null, h('th', null, ''), MONTHS.map((m, i) => h('th', {class: 'r'},
         h('button', {type: 'button', class: 'th-btn', title: `Add or change ${m} ${y.year}`, onclick: () => openEditor(y.year, i + 1)}, m))), h('th', {class: 'r'}, 'Total'))),
       h('tbody', null, ...lines('revenue_lines'), row('Total revenue', (m) => m.revenue, {strong: true}),
@@ -1175,7 +1809,11 @@ const pages = {
         ...lines('sga_lines'), row('Total fees and overheads', (m) => m.sga, {strong: true}),
         ...lines('tax_lines'),
         row('After fees (before COGS)', (m) => m.after_fees, {strong: true}),
-        row('Net profit', (m) => m.net_profit, {strong: true, flag: (m) => !m.has_cogs, flagNote: 'No cost of goods typed for this month, so it is counted as 0'}))))));
+        row('Net profit', (m) => m.net_profit, {strong: true, flag: (m) => !m.has_cogs, flagNote: 'No cost of goods typed for this month, so it is counted as 0'})))),
+      h('div', {class: 'source-foot'}, h('span', {class: 'muted'}, 'The figures are kept in the OTW Finance sheets of 4. Fund Management.xlsx.'),
+        h('button', {type: 'button', class: 'btn small', onclick: async () => {
+          try { await api('POST', '/api/fund/open'); toast('Opening Excel…'); } catch (e) { toast(e.message); }
+        }}, 'Open Excel'))));
 
     // dividend: the sheet's rule, (revenue - fees) x the month's payout rate, shared ออน / เบส; cost of goods is not taken off
     const onnPct = Math.round(d.split_onn * 100);
@@ -1218,9 +1856,10 @@ const pages = {
   },
 
   async wealth(host, tab = 'cards') {
-    const tabs = h('div', {class: 'tabs', role: 'tablist'}, [['cards', 'Wealth Cards'], ['family', 'Family Statement']].map(([id, label]) =>
+    const tabs = h('div', {class: 'tabs', role: 'tablist'}, [['cards', 'Cards'], ['family', 'Family Statement']].map(([id, label]) =>
       h('button', {type: 'button', role: 'tab', 'aria-selected': String(id === tab), onclick: () => go('wealth', id)}, label)));
-    host.append(h('div', {class: 'page-head'}, h('h2', {class: 'page-title'}, 'Wealth'), tabs));
+    host.append(h('div', {class: 'page-head'}, h('h2', {class: 'page-title'}, 'Saving'), tabs));
+    if (tab === 'cards') host.append(goalStrip(null, [{name: 'Saving Cash', label: 'Saving Cash'}, {name: 'Saving Bitcoin', label: 'Saving Bitcoin'}]));
     if (tab === 'family') {
       const f = await api('GET', '/api/family');
       if (!f.available) { host.append(h('article', {class: 'card'}, h('p', {class: 'note warn'}, f.reason))); return; }
@@ -1240,13 +1879,13 @@ const pages = {
     const again = () => go('wealth');
     const cardFields = [
       {key: 'name', label: 'Name', type: 'text', required: true},
-      {key: 'allocation', label: 'Shown in Asset Allocation as', type: 'select', options: [['saving', 'Saving'], ['emc', 'EMC']]},
+      {key: 'allocation', label: 'Shown in Asset Allocation as', type: 'select', options: [['emc', 'Cash'], ['saving', 'Bitcoin']]},
       {key: 'counts_in_total', label: 'Counted in Total Portfolio Value', type: 'check'},
       {key: 'note', label: 'Note', type: 'text'},
     ];
     const addCard = () => openForm({
       title: 'Add Wealth Card', values: {currency: 'THB', allocation: 'saving', counts_in_total: 1, opening_date: today()},
-      fields: [cardFields[0], {key: 'currency', label: 'Currency', type: 'text', hint: 'THB, USDT, USD …'}, ...cardFields.slice(1),
+      fields: [{key: 'name', label: 'Name', type: 'pick', options: ['Family Statement', 'Bitcoin', 'Cash', 'Gold'], required: true}, {key: 'currency', label: 'Currency', type: 'text', hint: 'THB, USDT, USD …'}, ...cardFields.slice(1),
         {key: 'opening_value', label: 'Opening value', type: 'number', hint: 'in the card’s currency; recorded as a deposit so it never shows as return'},
         {key: 'opening_fx_rate', label: 'FX rate', type: 'number', hint: 'THB per 1 unit; leave blank for THB'},
         {key: 'opening_date', label: 'Opening date', type: 'date'}],
@@ -1256,67 +1895,310 @@ const pages = {
       title: `Edit — ${a.name}`, values: a, fields: [...cardFields, {key: 'active', label: 'Active', type: 'check'}],
       submit: async (values) => { await api('PUT', `/api/accounts/${a.id}`, values); toast('Saved.'); again(); },
     });
-    host.append(h('div', {class: 'card-head'}, h('p', {class: 'note'}, 'Cards Best adds and values by hand. Each one is either Counted in Total Portfolio Value or Display-only.'),
-      h('button', {type: 'button', class: 'btn dark', onclick: addCard}, '+ Add card')),
-      h('div', {class: 'cards'}, cards.map((a) => {
+    // the page's own confirm box: a native confirm() can be blocked by the browser, and then Delete silently does nothing
+    const deleteCard = (a) => {
+      const dialog = $('#dialog');
+      dialog.style.width = 'min(420px, calc(100vw - 32px))';
+      const error = h('div', {class: 'form-error'});
+      dialog.replaceChildren(h('form', {class: 'form', method: 'dialog'}, h('h2', null, `Delete “${a.name}”?`),
+        h('p', {class: 'note'}, 'This removes the card with all its monthly values and deposits. It is logged in History, where it can be undone.'), error,
+        h('div', {class: 'form-buttons'}, h('button', {type: 'button', class: 'btn', onclick: () => dialog.close()}, 'Cancel'),
+          h('button', {type: 'button', class: 'btn danger', onclick: async () => {
+            try { await api('DELETE', `/api/accounts/${a.id}`); dialog.close(); toast('Card deleted.'); again(); } catch (e) { error.textContent = e.message; }
+          }}, 'Delete'))));
+      dialog.showModal();
+    };
+    const valueOf = (a) => (a.live ? a.live.value_thb : a.snapshot && a.snapshot.value_thb) || 0;
+    // EMC (Emergency Cash) is every Counted card shown as EMC: Family Statement + Saving + Cash. It is worked out, not typed.
+    const emcOrder = (a) => { const i = ['Family Statement', 'Saving', 'Cash'].indexOf(a.name); return i < 0 ? 9 : i; };
+    const emcParts = cards.filter((a) => a.group === 'emc' && a.counts_in_total).sort((x, y) => emcOrder(x) - emcOrder(y));
+    const emcTile = h('article', {class: 'card wcard'},
+      h('div', {class: 'card-head'}, h('div', {class: 'tile-label'}, h('span', null, 'Saving', h('span', {class: 'tile-abbr'}, 'Emergency Cash')))),
+      h('div', {class: 'tile-value'}, baht(emcParts.reduce((t, a) => t + valueOf(a), 0))),
+      h('div', {class: 'tile-sub'}, emcParts.map((a) => `${a.name} ${baht(valueOf(a))}`).join(' + ') || 'no cards counted as EMC'));
+    const first = ['Family Statement', 'BTC', 'Bitcoin'];
+    const ordered = [...first.map((n) => cards.find((a) => a.name === n)).filter(Boolean), ...cards.filter((a) => !first.includes(a.name))];
+    host.append(h('div', {class: 'cards-row'},
+      h('div', {class: 'cards'}, emcTile, ordered.map((a) => {
         const value = a.live ? a.live.value_thb : a.snapshot && a.snapshot.value_thb;
         const asOf = a.live ? a.live.as_of : a.snapshot && a.snapshot.as_of;
-        return h('article', {class: 'card'},
-          h('div', {class: 'card-head'}, h('div', {class: 'tile-label'}, a.name), h('button', {type: 'button', class: 'btn small', onclick: () => editCard(a)}, 'Edit')),
+        const ledger = a.source === 'family_statement';          // read from the ledger Maki keeps: nothing to edit or delete here
+        return h('article', ledger ? {class: 'card'} : {class: 'card wcard', title: 'Click to edit', onclick: () => editCard(a)},
+          h('div', {class: 'card-head'}, h('div', {class: 'tile-label'}, a.source === 'family_statement' ? h('span', null, 'Cash', h('span', {class: 'tile-abbr'}, a.name))
+              : ['BTC', 'Bitcoin'].includes(a.name) ? h('span', null, a.name, h('span', {class: 'tile-abbr'}, 'Crypto')) : a.name),
+            ledger ? null : h('button', {type: 'button', class: 'btn-del', onclick: (e) => { e.stopPropagation(); deleteCard(a); }}, 'Delete')),
           h('div', {class: 'tile-value'}, baht(value)),
           h('div', {class: 'tile-sub'}, asOf ? `as of ${asOf}` : 'no value yet', a.snapshot && a.currency !== 'THB' ? ` · ${number(a.snapshot.value_native)} ${a.currency}` : ''),
-          h('div', {class: 'tile-sub'}, h('span', {class: `badge ${a.counts_in_total ? 'on' : ''}`}, a.counts_in_total ? 'Counted' : 'Display-only'),
-            h('span', {class: 'badge'}, GROUPS[a.group][0]), a.source === 'manual' ? null : h('span', {class: 'badge'}, 'from ledger')));
-      })), ...accountLists(cards, again));
+          a.counts_in_total ? null : h('div', {class: 'tile-sub'}, h('span', {class: 'badge'}, 'Display-only')));      // a card that is not in Total Portfolio Value says so
+      })),
+      h('button', {type: 'button', class: 'btn dark', onclick: addCard}, '+ Add card')), ...accountLists(cards, again));
   },
 
-  async expense(host) {
+  async expense(host, picked) {
     const lines = await api('GET', '/api/cashflow');
-    host.append(pageHead('Expense', 'Best’s own Cash Flow by month: income by source, fixed costs, and what went to each Bucket.'));
-    const months = [...new Set(lines.map((l) => l.month))].sort().reverse();
-    const sum = (month, section) => lines.filter((l) => l.month === month && l.section === section).reduce((t, l) => t + l.amount_thb, 0);
+    const allMonths = [...new Set(lines.map((l) => l.month))].sort();
+    const month = allMonths.includes(picked) ? picked : allMonths[allMonths.length - 1];
+    const years = [...new Set(allMonths.map((m) => m.slice(0, 4)))].sort().reverse();
+    const year = month ? month.slice(0, 4) : String(new Date().getFullYear());
+    const months = allMonths.filter((m) => m.startsWith(year));          // the months of the year shown
+    const again = (m) => go('expense', m);
+    const tabs = h('div', {class: 'tabs', role: 'tablist'}, years.map((y) =>
+      h('button', {type: 'button', role: 'tab', 'aria-selected': String(y === year), onclick: () => again(allMonths.filter((m) => m.startsWith(y)).pop())}, y)));
+    host.append(h('div', {class: 'page-head'}, h('h2', {class: 'page-title'}, 'Cash flow management'), years.length ? tabs : null));
+
+    const sum = (m, section) => lines.filter((l) => l.month === m && l.section === section).reduce((t, l) => t + l.amount_thb, 0);
+    const spend = (m) => ({fixed: sum(m, 'fixed_cost'), other: sum(m, 'expense')});
+    const total = (m) => spend(m).fixed + spend(m).other;
+    const hasIncome = lines.some((l) => l.section === 'income');
+    const hasReinvest = lines.some((l) => l.section === 'allocation');
+    const FIXED = '#b4b4ae', OTHER = '#34342f', EARN = '#bfe3cf', REIN = '#9a9a94';       // fixed costs grey, expenses dark grey, income light green
+    const reinv = (m) => sum(m, 'allocation');
+    const free = (m) => sum(m, 'income') - total(m) - reinv(m);      // what is left of the month's income once spending and reinvesting are taken off
+    const SOURCES = [['Salary', '#2a2a29'], ['Online Shop', '#2f9e6e'], ['Trading', '#c98a1b'], ['Stock dividend', '#7b8cc4']];   // income sources drawn as lines
+
     if (months.length) {
-      host.append(h('article', {class: 'card'}, h('h2', {class: 'card-title'}, 'By month'), h('div', {class: 'table-wrap'}, h('table', null,
-        h('thead', null, h('tr', null, ['Month', 'Income', 'Fixed costs', 'To Buckets', 'Left over'].map((t, i) => h('th', {class: i ? 'r' : ''}, t)))),
-        h('tbody', null, months.map((m) => {
-          const left = sum(m, 'income') - sum(m, 'fixed_cost') - sum(m, 'allocation');
-          return h('tr', null, h('td', null, monthLabel(m)), h('td', {class: 'r'}, baht(sum(m, 'income'))), h('td', {class: 'r'}, baht(sum(m, 'fixed_cost'))),
-            h('td', {class: 'r'}, baht(sum(m, 'allocation'))), h('td', {class: `r ${signClass(left)}`}, baht(left)));
-        }))))));
+      const prev = allMonths[allMonths.indexOf(month) - 1];
+      const now = spend(month), earned = sum(month, 'income');
+      const average = months.reduce((t, m) => t + total(m), 0) / months.length;
+      const averageIncome = months.reduce((t, m) => t + sum(m, 'income'), 0) / months.length;
+      // each tile: the month's figure, its move against the month before (% + baht + MoM; for a cost a rise is red), and its share of income
+      const moveOf = (get, costly = false) => {
+        if (!prev) return null;
+        const was = get(prev), diff = get(month) - was;
+        if (!was) return null;
+        const good = costly ? -diff : diff;
+        return [h('span', {class: `delta ${signClass(good)}`}, signedPct(diff / Math.abs(was))), h('span', null, 'MoM')];
+      };
+      const ofIncome = (v, income = earned) => (income ? `${pct(v / income)} Inc.` : '');      // share of income, short
+      const cfTile = (label, value, move, share, title) => h('article', {class: 'card', title: title || null},
+        h('div', {class: 'tile-top'}, h('div', {class: 'tile-label'}, label), share ? h('span', {class: 'tile-share', title: 'Share of income'}, share) : null),
+        h('div', {class: 'tile-value'}, value),
+        move ? h('div', {class: 'tile-sub one-line'}, ...move) : null);
+      // the average month's spending split: how much of it is fixed costs and how much expenses
+      const avgFixed = months.reduce((t, m) => t + spend(m).fixed, 0) / months.length;
+      const fixedShare = average ? Math.round(avgFixed / average * 100) : null;
+      const splitOfAverage = fixedShare == null ? null : [h('span', null, `Fixed ${fixedShare}%`), h('span', null, '·'), h('span', null, `Expense ${100 - fixedShare}%`)];
+      const dot = (colour, text) => h('span', null, h('span', {class: 'dot', style: `background: ${colour}`}), text);
+      host.append(h('div', {class: 'tiles'},
+        hasIncome ? cfTile(dot(EARN, 'Income'), baht(earned), moveOf((m) => sum(m, 'income')), earned ? '' : 'none this month') : null,
+        cfTile('Total spending', baht(total(month)), moveOf(total, true), ofIncome(total(month))),
+        cfTile(dot(FIXED, 'Fixed costs'), baht(now.fixed), moveOf((m) => spend(m).fixed, true), ofIncome(now.fixed)),
+        hasIncome ? cfTile('Free cash flow', baht(free(month)), moveOf(free), ofIncome(free(month))) : null,
+        cfTile('Avg per month', baht(average), splitOfAverage, ofIncome(average, averageIncome), `Average of ${months.length} month${months.length > 1 ? 's' : ''} in ${year}`)));
+
+      // bars: spending (fixed costs under, expenses on top) beside income, one pair per month. Lines: each income source, and the
+      // average monthly spending of the year (dashed). A pair picks its month.
+      const W = 1000, H = 300, padL = 44, padB = 26, padT = 26;
+      const sources = SOURCES.filter(([name]) => months.some((m) => lines.some((l) => l.month === m && l.section === 'income' && l.line === name && l.amount_thb)));
+      const peak = Math.max(...months.map((m) => Math.max(total(m), sum(m, 'income'))), 1);
+      const step = [10000, 20000, 25000, 50000, 100000, 200000].find((s) => peak / s <= 5) || 200000;
+      const top = Math.ceil(peak / step) * step;
+      const plotH = H - padT - padB, yOf = (v) => H - padB - (v / top) * plotH;
+      const slot = (W - padL - 6) / months.length, bw = Math.min(30, slot * 0.34);
+      const chart = svg('svg', {viewBox: `0 0 ${W} ${H}`, class: 'bars', role: 'img', 'aria-label': 'Spending and income by month'});
+      for (let v = 0; v <= top; v += step) {
+        chart.append(svg('line', {x1: padL, x2: W - 6, y1: yOf(v), y2: yOf(v), class: 'grid-line'}), svg('text', {x: padL - 8, y: yOf(v) + 4, 'text-anchor': 'end', class: 'bar-lab'}, v ? `${v / 1000}k` : '0'));
+      }
+      const centre = (k) => padL + slot * k + slot / 2;
+      months.forEach((m, k) => {
+        const f = spend(m), earn = sum(m, 'income');
+        const xi = centre(k) - bw - 2, xs = centre(k) + 2;      // income on the left, spending beside it
+        const g = svg('g', {class: `bar ${m === month ? 'on' : ''}`, tabindex: 0, role: 'button', 'aria-label': `${monthLabel(m)} spending ${baht(total(m))}`});
+        g.append(svg('rect', {x: padL + slot * k, y: 0, width: slot, height: H, fill: 'transparent'}),
+          svg('rect', {x: xs, y: yOf(f.fixed), width: bw, height: Math.max(yOf(0) - yOf(f.fixed), 0), rx: 4, fill: FIXED}),
+          f.other > 0 ? svg('rect', {x: xs, y: yOf(f.fixed + f.other), width: bw, height: yOf(f.fixed) - yOf(f.fixed + f.other), rx: 4, fill: OTHER}) : null,
+          earn > 0 ? svg('rect', {x: xi, y: yOf(earn), width: bw, height: yOf(0) - yOf(earn), rx: 4, fill: EARN}) : null,
+          svg('text', {x: xs + bw / 2, y: yOf(total(m)) - 6, 'text-anchor': 'middle', class: 'bar-val'}, total(m) ? `${Math.round(total(m) / 1000)}k` : ''),
+          svg('text', {x: centre(k), y: H - 8, 'text-anchor': 'middle', class: 'bar-lab month'}, MONTHS[Number(m.slice(5, 7)) - 1]));
+        g.addEventListener('click', () => again(m));
+        g.addEventListener('keydown', (e) => { if (e.key === 'Enter') again(m); });
+        chart.append(g);
+      });
+      chart.append(svg('line', {x1: padL, x2: W - 6, y1: yOf(average), y2: yOf(average), class: 'avg-line'}),
+        svg('text', {x: W - 8, y: yOf(average) - 5, 'text-anchor': 'end', class: 'avg-lab'}, `avg ${Math.round(average / 1000)}k`));
+      const incomeOf = (m, name) => lines.filter((l) => l.month === m && l.section === 'income' && (!name || l.line === name)).reduce((t, l) => t + l.amount_thb, 0);
+      const drawn = [['Income', 'var(--up)', (m) => incomeOf(m)], ...(sources.length > 1 ? sources.map(([name, colour]) => [name, colour, (m) => incomeOf(m, name)]) : [])];
+      if (hasIncome) for (const [, colour, get] of drawn) {
+        const pts = months.map((m, k) => [centre(k), yOf(get(m))]);
+        chart.append(svg('polyline', {points: pts.map((q) => q.join(',')).join(' '), fill: 'none', stroke: colour, 'stroke-width': 1.8, 'stroke-linejoin': 'round', 'pointer-events': 'none'}),
+          ...pts.map(([x, y]) => svg('circle', {cx: x, cy: y, r: 3, fill: '#fff', stroke: colour, 'stroke-width': 1.6, 'pointer-events': 'none'})));
+      }
+      const key = (colour, label, extra = '') => h('span', null, h('i', {style: `background: ${colour}; ${extra}`}), label);
+      const legend = h('div', {class: 'spend-legend'}, hasIncome ? key(EARN, 'Income') : null, key(FIXED, 'Fixed costs'), key(OTHER, 'Expenses'),
+        ...(hasIncome ? drawn : []).map(([name, colour]) => key(colour, name, 'height: 3px; border-radius: 2px; width: 12px;')), key('var(--muted)', 'Average spending', 'height: 0; width: 12px; background: none; border-top: 2px dashed var(--muted); border-radius: 0;'));
+
+      // the picked month's lines, each with a bar showing its size against the month's largest line
+      const block = (title, section, colour) => {
+        const rows = lines.filter((l) => l.month === month && l.section === section && l.amount_thb).sort((a, b) => b.amount_thb - a.amount_thb);
+        const big = rows.length ? rows[0].amount_thb : 1;
+        return h('div', {class: 'spend-block'},
+          h('div', {class: 'spend-head'}, h('span', null, h('i', {class: 'dot', style: `background: ${colour}`}), title), h('b', null, baht(rows.reduce((t, l) => t + l.amount_thb, 0)))),
+          rows.length ? rows.map((l) => h('div', {class: 'spend-row', title: l.note || null},
+            h('span', {class: 'spend-name'}, l.line), h('span', {class: 'spend-amt'}, baht(l.amount_thb)),
+            h('span', {class: 'spend-bar'}, h('span', {style: `width: ${Math.max(2, l.amount_thb / big * 100)}%; background: ${colour}`}))))
+            : h('p', {class: 'empty'}, 'Nothing this month.'));
+      };
+      const picker = h('select', {class: 'month-pick', 'aria-label': 'Month'}, [...months].reverse().map((m) => h('option', {value: m}, monthLabel(m))));
+      picker.value = month;
+      picker.addEventListener('change', () => again(picker.value));
+      // the same hover as the other charts: a rule through the month, and a light card beside it listing the figures
+      const rule = svg('line', {y1: padT - 8, y2: H - padB, stroke: 'var(--muted)', 'stroke-width': 1, visibility: 'hidden', 'pointer-events': 'none'});
+      chart.append(rule);
+      const tip = h('div', {class: 'tip light'});
+      const plot = h('div', {class: 'chart bars-wrap'}, chart, tip);
+      chart.addEventListener('pointermove', (event) => {
+        const box = plot.getBoundingClientRect(), scale = box.width / W;
+        const k = Math.min(months.length - 1, Math.max(0, Math.floor(((event.clientX - box.left) / scale - padL) / slot)));
+        const m = months[k], f = spend(m), dot = (c) => h('i', {class: 'tip-dot', style: `background: ${c}`});
+        rule.setAttribute('x1', centre(k)); rule.setAttribute('x2', centre(k)); rule.setAttribute('visibility', 'visible');
+        const row = (c, name, v, cls = '') => h('div', {class: `tip-line ${cls}`}, h('span', {class: 'tip-name'}, c ? dot(c) : null, name), h('b', null, baht(v)));
+        tip.replaceChildren(h('div', {class: 'tip-head'}, monthLabel(m)),
+          ...(hasIncome ? [row(EARN, 'Income', incomeOf(m))] : []),
+          row(null, 'Spending', total(m)),
+          row(FIXED, 'Fixed costs', f.fixed, 'tip-extra'), row(OTHER, 'Expenses', f.other),
+          ...(reinv(m) ? [row(REIN, 'Reinvest', reinv(m))] : []),
+          ...(hasIncome ? [row(null, 'Free cash flow', free(m))] : []),
+          row(null, 'Average spending', average));
+        tip.style.display = 'block';
+        const tipW = tip.offsetWidth, tipH = tip.offsetHeight, px0 = centre(k) * scale, gap = 14;
+        tip.style.left = `${Math.max(0, px0 + gap + tipW <= box.width ? px0 + gap : px0 - gap - tipW)}px`;
+        tip.style.top = `${Math.max(0, Math.min(box.height - tipH, (event.clientY - box.top) - tipH / 2))}px`;
+      });
+      chart.addEventListener('pointerleave', () => { rule.setAttribute('visibility', 'hidden'); tip.style.display = 'none'; });
+      host.append(h('article', {class: 'card'}, h('h2', {class: 'card-title'}, `Spending and income ${year}`), plot, legend));
+      const byMonth = h('article', {class: 'card'}, h('div', {class: 'card-head'}, h('h2', {class: 'card-title'}, `By month ${year}`),
+        h('button', {type: 'button', class: 'btn small add', onclick: () => cashflowEditor(null, lines, month)}, '+ Add')), h('div', {class: 'table-wrap'}, h('table', null,
+        h('thead', null, h('tr', null, ['Month', ...(hasIncome ? ['Income'] : []), 'Fixed costs', 'Expenses', 'Spending', ...(hasReinvest ? ['Reinvest'] : []), ...(hasIncome ? ['Free cash flow'] : [])].map((t, k) => h('th', {class: k ? 'r' : ''}, t)))),
+        h('tbody', null, [...months].reverse().map((m) => {
+          const f = spend(m), left = free(m);
+          return h('tr', {class: m === month ? 'picked' : ''}, h('td', {class: 'nowrap'}, monthLabel(m)), hasIncome ? h('td', {class: 'r'}, baht(sum(m, 'income'))) : null,
+            h('td', {class: 'r'}, baht(f.fixed)), h('td', {class: 'r'}, f.other ? baht(f.other) : h('span', {class: 'muted'}, '–')), h('td', {class: 'r'}, h('b', null, baht(total(m)))),
+            hasReinvest ? h('td', {class: 'r'}, reinv(m) ? baht(reinv(m)) : h('span', {class: 'muted'}, '–')) : null,
+            hasIncome ? h('td', {class: `r ${signClass(left)}`}, baht(left)) : null);
+        })))));
+
+      // the picked month's income split: what share went to fixed costs, spending, reinvesting, and what was left
+      const fixedNow = now.fixed, otherNow = now.other, reinNow = reinv(month);
+      const leftNow = earned - fixedNow - otherNow - reinNow;
+      const slices = [['Fixed costs', fixedNow, FIXED], ['Expenses', otherNow, OTHER], ['Reinvest', reinNow, REIN], ['Free cash flow', Math.max(leftNow, 0), EARN]].filter(([, v]) => v > 0);
+      const sliceTotal = slices.reduce((t, [, v]) => t + v, 0);
+      const pieBox = h('div', {class: 'donut'});
+      const pieCard = h('article', {class: 'card'}, h('h2', {class: 'card-title'}, `Where the income went · ${monthLabel(month)}`),
+        slices.length ? h('div', {class: 'donut-wrap'}, pieBox, h('div', {class: 'legend'}, slices.map(([label, v, colour]) =>
+          h('div', {class: 'legend-item'}, h('span', null, h('span', {class: 'dot', style: `background: ${colour}`}), label), h('span', null, `${baht(v)} · ${pct(v / sliceTotal)}`)))))
+          : h('p', {class: 'empty'}, 'Nothing recorded for this month.'),
+        !earned && slices.length ? h('p', {class: 'note'}, 'No income entered for this month, so the shares are of what went out.') : null,
+        earned && leftNow < 0 ? h('p', {class: 'note warn'}, `Money out is ${baht(-leftNow)} more than the income entered, so the shares are of what went out.`) : null);
+      if (slices.length) donut(pieBox, slices.map(([label, value, color]) => ({label, value, color})), {total: sliceTotal});
+      host.append(h('div', {class: 'pair'},
+        h('article', {class: 'card'}, h('div', {class: 'card-head'}, h('h2', {class: 'card-title'}, `Where the money went · ${monthLabel(month)}`), picker),
+          hasIncome && earned ? block('Income', 'income', EARN) : null, block('Fixed costs', 'fixed_cost', FIXED), block('Expenses', 'expense', OTHER),
+          hasReinvest ? block('Reinvest', 'allocation', REIN) : null),
+        h('div', {class: 'stack'}, pieCard, byMonth)));
     }
     host.append(crud({
-      title: 'Cash Flow lines', resource: 'cashflow', onChange: () => go('expense'),
-      note: 'Money sent to the family account is one fixed-cost line here.',
-      defaults: () => ({month: today().slice(0, 7), section: 'fixed_cost'}),
+      title: months.length ? `Cash flow log · ${monthLabel(month)}` : 'Cash flow log', resource: 'cashflow', query: months.length ? `?month=${month}` : '', noAdd: months.length > 0,
+      headExtra: months.length ? (() => {
+        const pick = h('select', {class: 'month-pick', 'aria-label': 'Month'}, [...months].reverse().map((m) => h('option', {value: m}, monthLabel(m))));
+        pick.value = month;
+        pick.addEventListener('change', () => again(pick.value));
+        return pick;
+      })() : null, onChange: () => again(month),
+      note: 'Every income, fixed cost, expense and reinvestment of the month. Add one to say where the money came from or went.',
+      editor: (row) => cashflowEditor(row, lines, month),
       columns: [
-        {key: 'month', label: 'Month', type: 'text', required: true, hint: 'YYYY-MM', show: (r) => monthLabel(r.month), cls: 'nowrap'},
-        {key: 'section', label: 'Section', type: 'select', options: [['income', 'Income'], ['fixed_cost', 'Fixed cost'], ['allocation', 'To a Bucket']]},
-        {key: 'line', label: 'Line', type: 'text', required: true},
-        {key: 'amount_thb', label: 'Amount', type: 'money', required: true, cls: 'r'},
-        {key: 'note', label: 'Note', type: 'text'},
-        {key: 'entered_by', label: 'By', form: false, cls: 'muted'},
+        {key: 'section', label: 'Type', show: (r) => cashflowLabel(r.section)},
+        {key: 'line', label: 'Item', show: (r) => (r.section === 'allocation' && REINVEST_TAB[r.line] ? h('a', {href: `#${REINVEST_TAB[r.line]}`, class: 'tab-link', title: `Open ${r.line}`}, `${r.line} ↗`) : r.line)},
+        {key: 'amount_thb', label: 'Amount', type: 'money', cls: 'r'},
+        {key: 'note', label: 'Note'},
+        {key: 'entered_by', label: 'By', cls: 'muted'},
       ],
     }));
   },
 
   async plan(host) {
-    const d = await api('GET', '/api/home');
-    host.append(pageHead('Plan', 'Goal for each Bucket by year, against its current value.'));
-    if (d.goals.length) {
-      host.append(h('article', {class: 'card'}, h('h2', {class: 'card-title'}, `${d.goals[0].year} so far`), h('div', {class: 'table-wrap'}, h('table', null,
-        h('thead', null, h('tr', null, ['Bucket', 'Now', 'Goal', 'Progress'].map((t, i) => h('th', {class: i ? 'r' : ''}, t)))),
-        h('tbody', null, d.goals.map((g) => h('tr', null, h('td', null, g.bucket[0].toUpperCase() + g.bucket.slice(1)), h('td', {class: 'r'}, baht(g.actual_thb)),
-          h('td', {class: 'r'}, baht(g.goal_thb)), h('td', {class: 'r'}, pct(g.progress)))))))));
+    const d = await api('GET', '/api/plan');
+    const t = d.this_year, big = d.big;
+    if (!t) {
+      host.append(pageHead('Plan', 'Targets by year, against the current value.'),
+        h('article', {class: 'card'}, h('p', {class: 'note'}, 'No Goals or monthly values yet. Add Goals below, or run scripts/import_fund_management.py.')));
+    } else {
+      const asOf = monthLabel(t.month);
+      host.append(pageHead('Plan', `Best’s targets from the plan sheet, against where everything stood at the end of ${asOf}.`));
+      const span = planSpan, meter = planMeter, fact = planFact;
+      // ---- how the money moves and the goal behind the plan, with this year's target beside it
+      const yearCard = planYearRing(t, planGoalCards(t, true));
+      const last = d.roadmap.find((r) => r.year === big.year);
+      const bigCard = h('article', {class: 'card plan-hero big'},
+        h('div', {class: 'card-head'}, h('h2', {class: 'caps'}, `Big target${big.age ? ` · age ${big.age}` : ''}`), h('span', {class: 'chip'}, big.months_left > 0 ? `${span(big.months_left)} left` : 'due')),
+        h('div', {class: 'hero-value'}, baht(big.target_thb)),
+        h('div', {class: 'note'}, `Total Portfolio Value by Dec ${big.year}`),
+        meter(big.progress, 'ink'),
+        h('div', {class: 'facts'},
+          fact('Now', baht(big.actual_thb), `end of ${asOf}`),
+          fact('To go', baht(Math.max(big.gap_thb, 0)), big.actual_thb ? `${number(big.target_thb / big.actual_thb, 1)}× today’s value` : null),
+          big.needed_growth == null ? null : fact('Needed per year', signedPct(big.needed_growth), 'growth in value, deposits counted')),
+        last ? h('p', {class: 'note'}, `The plan for ${big.year}: ` + [['Stock', last.plan.investment], ['Trading', last.plan.trading], ['Saving Cash', last.plan.emc], ['Saving Bitcoin', last.plan.saving]]
+          .filter(([, v]) => v).map(([k, v]) => `${k} ${shortBaht(v)}`).join(' · ') + '.') : null);
+      host.append(h('div', {class: 'plan-top'}, d.flow ? financeFlowCard(d.flow) : null, yearCard));
+
+      // ---- the road to the big target with the big target beside it, then what Maki has to say about the plan
+      const chartRows = [...d.history.map((x) => ({month: `${x.year}-12`, label: String(x.year), actual: x.actual_thb, plan: null})),
+        ...d.roadmap.map((r) => ({month: r.as_of || `${r.year}-12`, label: String(r.year), actual: r.actual_thb, plan: r.target_thb, age: r.age, current: r.year === t.year}))];
+      const chartBox = h('div', {class: 'chart'});
+      const roadCard = h('article', {class: 'card'},
+        h('div', {class: 'card-head'}, h('h2', {class: 'card-title'}, 'Road to the big target'),
+          h('div', {class: 'legend-row'}, h('span', null, h('span', {class: 'dot', style: 'background: var(--up)'}), 'Actual'), h('span', null, h('span', {class: 'dot', style: 'background: var(--tan)'}), 'Plan (year end)'))),
+        chartBox);
+      const noteRow = (n) => h('div', {class: 'advice-item'},
+        h('div', {class: 'advice-meta'}, h('span', null, fmtDay(n.noted_on)), h('span', null, n.entered_by === 'best' ? 'Best' : n.entered_by[0].toUpperCase() + n.entered_by.slice(1))),
+        h('p', {class: 'advice-body'}, n.body));
+      const addNote = () => openForm({
+        title: 'Add — note on the Plan', values: {noted_on: today(), topic: 'Plan'},
+        fields: [{key: 'noted_on', label: 'Date', type: 'date', required: true}, {key: 'topic', label: 'Topic', type: 'text', required: true, hint: 'keep “Plan” in it so the note shows here'},
+          {key: 'body', label: 'Note', type: 'textarea', required: true}],
+        submit: async (v) => { await api('POST', '/api/advice', v); toast('Added.'); go('plan'); },
+      });
+      const adviceCard = h('article', {class: 'card advice-card'},
+        h('div', {class: 'card-head'}, h('h2', {class: 'caps'}, 'Maki Advise'), h('button', {type: 'button', class: 'btn small add', onclick: addNote}, '+ Add')),
+        d.advice.length ? h('div', {class: 'advice-list'}, d.advice.map(noteRow))
+          : h('p', {class: 'empty'}, 'Nothing about the plan yet. Maki’s notes with the topic “Plan” appear here: what the figures show against this plan, never a call to buy or sell.'),
+        h('button', {type: 'button', class: 'btn wide', onclick: () => go('advise')}, 'All notes →'));
+      host.append(h('div', {class: 'plan-top'}, roadCard, bigCard), adviceCard);
+      lineChart(chartBox, chartRows, [{key: 'plan', name: 'Plan (year end)', color: 'var(--tan)', dash: '4 4', width: 1.5}, {key: 'actual', name: 'Actual', color: 'var(--up)', width: 2.5}],
+        {format: baht, axisFormat: shortBaht, xLabel: (r) => r.label, xAnchor: 'fit',
+          extra: (r) => [r.age ? ['Age', String(r.age)] : null, r.actual != null && r.plan != null ? [r.current ? 'To this year’s target' : 'Against plan', baht(r.actual - r.plan)] : null]});
+
+      // ---- every year of the plan
+      const cell = (v) => h('td', {class: 'r'}, v ? baht(v) : h('span', {class: 'muted'}, '–'));
+      host.append(h('article', {class: 'card'}, h('h2', {class: 'card-title'}, 'Target Breakdown', h('span', {class: 'tile-abbr'}, 'Year by Year')),
+        h('p', {class: 'note'}, 'Year-end targets. The portfolio target adds Stock, Trading, Saving Cash and Saving Bitcoin; the Online Shop figure is a yearly income target and is not part of it.'),
+        h('div', {class: 'table-wrap'}, h('table', null,
+          h('thead', null, h('tr', null, ['Year', 'Age', 'Stock', 'Trading', 'Saving Cash', 'Saving Bitcoin', 'Portfolio target', 'Actual', 'Against plan', 'Online Shop income'].map((x, k) => h('th', {class: `${k ? 'r' : ''} ${k === 6 ? 'hl' : ''}`}, x)))),
+          h('tbody', null, d.roadmap.map((r) => h('tr', {class: r.year === t.year ? 'picked' : ''},
+            h('td', null, r.year), h('td', {class: 'r'}, r.age || ''), cell(r.plan.investment), cell(r.plan.trading), cell(r.plan.emc), cell(r.plan.saving),
+            h('td', {class: 'r hl'}, h('b', null, baht(r.target_thb))),
+            h('td', {class: 'r'}, r.actual_thb == null ? h('span', {class: 'muted'}, '–') : [baht(r.actual_thb), r.year === t.year ? h('span', {class: 'muted'}, ` (${MONTHS[Number(t.month.slice(5, 7)) - 1]})`) : null]),
+            h('td', {class: `r ${signClass(r.diff_thb)}`}, r.diff_thb == null ? (r.year === t.year ? h('span', {class: 'muted'}, pct(t.progress)) : '') : baht(r.diff_thb)),
+            cell(r.income_thb)))))),
+        h('div', {class: 'source-foot'}, h('span', {class: 'muted'}, 'The plan is drawn in the Fin Plan(Y) sheet of 4. Fund Management.xlsx.'),
+          h('button', {type: 'button', class: 'btn small', onclick: async () => {
+            try { await api('POST', '/api/fund/open'); toast('Opening Excel…'); } catch (e) { toast(e.message); }
+          }}, 'Open Excel'))));
+      crudYear.Goals = String(t.year);
     }
     host.append(crud({
-      title: 'Goals', resource: 'goals', onChange: () => go('plan'),
-      note: 'A Goal with no Bucket (such as OnTheWall) is kept for the record and is outside Total Portfolio Value.',
+      title: 'Goals', resource: 'goals', byYear: (r) => String(r.year), sort: goalTableOrder, onChange: () => go('plan'),
+      note: 'One Goal per year and name. A Goal with no Bucket (such as OnTheWall) is an income target and stays outside Total Portfolio Value.',
       defaults: () => ({year: new Date().getFullYear(), bucket: 'investment'}),
       columns: [
         {key: 'year', label: 'Year', type: 'number', required: true, show: (r) => r.year},
-        {key: 'name', label: 'Name', type: 'text', required: true},
-        {key: 'bucket', label: 'Bucket', type: 'select', options: [['investment', 'Investment'], ['trading', 'Trading'], ['wealth', 'Wealth'], ['', 'None']]},
+        {key: 'name', label: 'Name', type: 'text', required: true, show: (r) => goalLabel(r.name)},
+        {key: 'bucket', label: 'Bucket', type: 'select', table: false, options: [['investment', 'Stock'], ['trading', 'Trading'], ['wealth', 'Wealth'], ['', 'None']]},
         {key: 'goal_thb', label: 'Goal', type: 'money', required: true, cls: 'r'},
+        {key: 'monthly_thb', label: 'Monthly plan', type: 'money', cls: 'r', hint: 'reinvestment per month'},
+        {key: 'growth_pct', label: 'Growth', type: 'number', cls: 'r', hint: 'as a share: 0.15 = 15%', show: (r) => (r.growth_pct == null ? '' : signedPct(r.growth_pct))},
+        {key: 'note', label: 'Action plan', type: 'textarea', cls: 'wrap'},
       ],
     }));
   },
@@ -1383,7 +2265,7 @@ window.addEventListener('resize', () => {           // charts are drawn at their
 });
 // the line after the logo in the top bar: what this page is and how fresh its figures are (Home writes its own sentence)
 let statusMonth = '';
-const PAGE_NAMES = {investment: 'Investment Portfolio', trading: 'Trading Portfolio', shop: 'EMBRACE Shop', wealth: 'Wealth', expense: 'Expense',
+const PAGE_NAMES = {investment: 'Stock Portfolio', trading: 'Trading Portfolio', shop: 'Online Shop', wealth: 'Saving', expense: 'Cash flow management',
   plan: 'Plan', assets: 'All Asset Class', advise: 'Maki Advise', history: 'History'};
 function setStatus(name) {
   if (name === 'home') { if (statusMonth) $('#sub').textContent = `Here is how everything stood at the end of ${statusMonth}.`; return; }

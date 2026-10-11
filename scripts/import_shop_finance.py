@@ -8,7 +8,8 @@ dates in the block's header row (the 25 and 26 sheets' blocks are still labelled
 
   * a month the dashboard does not have yet (2024 and 2025 at first) is added in full;
   * for a month it already has, the sheet's Shopee Fees (row 38) is set when the sheet has a number, because that row was
-    filled in later; every other line Best typed in the dashboard is left as it is, and any difference is only reported;
+    filled in later, and a cost of goods line (Uneedcargo, Alipay, ETC) the sheet has and the dashboard does not is added;
+    every other line Best typed in the dashboard is left as it is, and any difference is only reported;
   * every month gets its "Payout %" (the dividend rate the sheet applies to revenue minus fees: 38 or 33), worked out from
     the sheet's own dividend row, for 2023 to 2026.
 
@@ -140,7 +141,7 @@ def check(month):
 def main():
     cfg = config.load()
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--workbook", default=os.path.join(config.EMBRACE_OS_DIR, "EMBRACE SHOP", "ONTHEWALL", "ONTHEWALL SHOP BS.xlsx"))
+    ap.add_argument("--workbook", default=cfg["fund_workbook_path"])      # 4. Fund Management.xlsx holds the OTW Finance 24 / 25 / 26 sheets Best keeps up
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     from openpyxl import load_workbook
@@ -189,6 +190,10 @@ def main():
         if m["pct"] is not None and current.get(PAYOUT, {}).get("amount") != m["pct"]:
             changed.append(f"Payout % -> {m['pct']:g}")
             current[PAYOUT] = {"section": "dividend", "line": "Payout %", "amount": m["pct"]}
+        for key, entry in sheet.items():                        # cost of goods Best filled in on the sheet after the month was copied
+            if key[0] == "cogs" and key not in current and entry:
+                changed.append(f"{key[1]} {entry:,.2f}")
+                current[key] = {"section": "cogs", "line": key[1], "amount": entry}
         for key, amount in sheet.items():                       # reported, never applied
             if key != ("sga", "Shopee Fees") and key in current and abs(current[key]["amount"] - amount) > 0.01:
                 notes.append(f"{ym[0]}-{ym[1]:02d} {key[1]}: dashboard {current[key]['amount']:,.2f}, sheet {amount:,.2f} (left as it is)")

@@ -5,6 +5,7 @@
 This system reads figures and records them. It holds no credential that can
 trade, transfer or withdraw, and has no route that moves money (ADR 0002).
 """
+import calendar
 import json
 import mimetypes
 import os
@@ -25,7 +26,7 @@ import config  # noqa: E402
 import db  # noqa: E402
 import lock  # noqa: E402
 import metrics  # noqa: E402
-from sources import family, shop  # noqa: E402
+from sources import family, journal as journal_file, shop  # noqa: E402
 
 CFG = config.load()
 LOCAL_HOSTS = ("localhost", "127.0.0.1")
@@ -204,8 +205,8 @@ def clean_cashflow(conn, body, old, actor):
     month = str(pick("month") or "")
     if not re.match(r"^[0-9]{4}-(0[1-9]|1[0-2])$", month):
         raise ApiError("month must be in YYYY-MM form")
-    if pick("section") not in ("income", "fixed_cost", "allocation"):
-        raise ApiError("section must be income, fixed_cost or allocation")
+    if pick("section") not in ("income", "fixed_cost", "expense", "allocation"):
+        raise ApiError("section must be income, fixed_cost, expense or allocation")
     vals = {"month": month, "section": pick("section"), "line": text(pick("line"), "line", required=True),
             "amount_thb": as_num(pick("amount_thb"), "amount_thb"), "note": text(pick("note"), "note")}
     if old is None:
@@ -234,8 +235,13 @@ def clean_goal(conn, body, old, actor):
         year = int(pick("year"))
     except (TypeError, ValueError):
         raise ApiError("year must be a whole number")
-    return {"year": year, "name": text(pick("name"), "name", required=True), "bucket": bucket,
-            "goal_thb": as_num(pick("goal_thb"), "goal_thb")}
+    optional = lambda key: None if pick(key) in (None, "") else as_num(pick(key), key)   # noqa: E731
+    growth = optional("growth_pct")
+    if growth is not None and not -1 <= growth <= 10:
+        raise ApiError("growth_pct is a share: 0.15 means 15%")
+    return {"year": year, "name": text(pick("name"), "name", required=True), "bucket": bucket or None,
+            "goal_thb": as_num(pick("goal_thb"), "goal_thb"), "monthly_thb": optional("monthly_thb"),
+            "growth_pct": growth, "note": text(pick("note"), "note")}
 
 
 def clean_upcoming(conn, body, old, actor):
@@ -369,7 +375,210 @@ def h_home(conn, body, q, who):
         "projects": rows(conn, "SELECT * FROM projects ORDER BY name"),
         "shop": {"available": shop_data["available"], "reason": shop_data["reason"]},
         "flows_recorded_from": db.get_setting(conn, "flows_recorded_from") or None,
+        "trading_journal": journal_view(conn).get("stats"),      # the figure the Trading page's Trading Portfolio tile shows
     }
+
+
+def h_plan(conn, body, q, who):
+    """The Plan page: this year's Goals, the road to the last Goal year, and Maki's notes about the plan."""
+    income = {}
+    try:        # OnTheWall's Goal is the shop's profit for dividend in the year
+        years = shop.build_finance(shop_rows(conn), {}, float(db.get_setting(conn, "shop_dividend_split_onn")))
+        income["OnTheWall"] = {y["year"]: round(sum(m["dividend_pool"] or 0 for m in y["months"]), 2) for y in years}
+    except Exception:           # the shop figures are a comparison, never a reason for the Plan not to load
+        traceback.print_exc()
+    out = metrics.plan_view(conn, finished_rows(conn), income) or {}
+    if out.get("this_year"):
+        live = live_saving(conn)
+        for item in out["this_year"]["items"]:
+            now = live.get(item["group"])
+            if now is not None and item["goal_thb"]:
+                item.update(actual_thb=round(now[0], 2), progress=now[0] / item["goal_thb"], gap_thb=round(item["goal_thb"] - now[0], 2), as_of=now[1])
+    out["advice"] = rows(conn, "SELECT * FROM advice_notes WHERE lower(topic) LIKE '%plan%' ORDER BY noted_on DESC, id DESC LIMIT 8")
+    out["flow"] = metrics.finance_flow(conn, finished_rows(conn), plan_yields(conn), out.get("roadmap"), plan_flow(conn),
+                                       plan_debts(conn), plan_reinvest(conn))
+    return out
+
+
+def live_saving(conn):
+    """The two Saving Goals are measured by the cards on the Saving page as they stand now, not by the last month end:
+    Saving Cash is the Family Statement ledger's balance, Saving Bitcoin the Bitcoin card's latest value. {group: (value, as_of)}"""
+    fam = family.ledger(CFG["family_xlsx_path"])
+    live = {"emc": (fam["balance"], fam["last_date"]) if fam.get("available") and fam.get("balance") is not None else None}
+    coin = next((a for a in metrics.latest_values(conn) if a["bucket"] == "wealth" and a["name"] in ("Bitcoin", "BTC")), None)
+    live["saving"] = (coin["snapshot"]["value_thb"], coin["snapshot"]["as_of"]) if coin and coin["snapshot"] else (0.0, None) if coin else None
+    return live
+
+
+GOAL_GROUP = {"Stock": "investment", "Trading": "trading", "Saving Cash": "emc", "Saving Bitcoin": "saving"}
+
+
+def h_goal_bars(conn, body, q, who):
+    """Progress of one year's Goals for the bars at the top of the Stock, Trading, Online Shop and Saving pages:
+    {name: {goal_thb, actual_thb, as_of}}. A year's actual is the value at its December (or the latest finished month for the
+    current year); Saving Cash and Saving Bitcoin use the live card values for the current year. OnTheWall is the shop's profit
+    for dividend in the year, with the latest month against its monthly aim. A year with no Goal returns nothing."""
+    finished = finished_rows(conn)
+    if not finished:
+        return {"year": None, "bars": {}}
+    latest = finished[-1]
+    asked = (q.get("year") or [None])[0]
+    year = int(asked) if asked and asked.isdigit() else int(latest["month"][:4])
+    by = {r["month"]: r for r in finished}
+    ref = by.get(f"{year}-12") or (latest if latest["month"][:4] == str(year) else None)
+    values = metrics.group_values(ref) if ref else {}
+    live = live_saving(conn) if ref is latest else {}
+    bars = {}
+    for g in conn.execute("SELECT * FROM goals WHERE year=?", (year,)):
+        name = g["name"]
+        if name in GOAL_GROUP and ref:
+            group = GOAL_GROUP[name]
+            now = live.get(group)
+            value, as_of = (now if now is not None else (values.get(group, 0.0), ref["month"]))
+            bars[name] = {"goal_thb": round(g["goal_thb"], 2), "actual_thb": round(value, 2), "as_of": as_of}
+        elif name == "OnTheWall":
+            try:
+                months = [m for y in shop.build_finance(shop_rows(conn), {}, 0.6) if y["year"] == year for m in y["months"] if m["dividend_pool"] is not None]
+            except Exception:
+                traceback.print_exc()
+                months = []
+            bar = {"goal_thb": round(g["goal_thb"], 2), "actual_thb": round(sum(m["dividend_pool"] for m in months), 2), "as_of": None}
+            if g["monthly_thb"] and months:
+                bar["month"] = {"month": months[-1]["month"], "actual_thb": months[-1]["dividend_pool"], "aim_thb": round(g["monthly_thb"], 2)}
+            bars[name] = bar
+    return {"year": year, "bars": bars}
+
+
+def plan_yields(conn):
+    return {"stock": float(db.get_setting(conn, "plan_yield_stock")), "trading": float(db.get_setting(conn, "plan_yield_trading"))}
+
+
+def h_plan_yields(conn, body, q, who):
+    """The yearly yields the plan counts on for Stock and Trading, as shares (0.15 = 15%). Best only."""
+    if who is None:
+        raise ApiError("writes need Maki's token or the dashboard page's own session", 401)
+    if who != auth.BEST:
+        raise ApiError(f"{who} may not change the plan's yields; only Best can, from the dashboard", 403)
+    out = {}
+    for key in ("stock", "trading"):
+        value = as_num(body.get(key), key)
+        if not 0 <= value <= 5:
+            raise ApiError(f"{key} is a share of the value per year: 0.15 means 15%")
+        out[key] = value
+    for key, value in out.items():
+        db.set_setting(conn, f"plan_yield_{key}", value)
+    return out
+
+
+def plan_flow(conn):
+    """The rows Best typed into the Income and Spending tables of the Plan page, {"income": [{group, name, amount}], "spending": [...]};
+    a box with no rows here shows the Cash flow log's average instead."""
+    try:
+        saved = json.loads(db.get_setting(conn, "plan_flow") or "{}")
+    except ValueError:
+        saved = {}
+    return {k: v for k, v in saved.items() if k in metrics.FLOW_GROUPS and isinstance(v, list) and v} if isinstance(saved, dict) else {}
+
+
+def h_plan_flow(conn, body, q, who):
+    """Set the rows of the Plan page's Income or Spending table: {"box": "income", "rows": [{"group": "Active", "name": "Salary",
+    "amount": 120000}]}. rows null puts back the Cash flow log's average. Best only; the log itself is not changed."""
+    if who is None:
+        raise ApiError("writes need Maki's token or the dashboard page's own session", 401)
+    if who != auth.BEST:
+        raise ApiError(f"{who} may not change the plan's figures; only Best can, from the dashboard", 403)
+    box, rows_in = body.get("box"), body.get("rows")
+    if box not in metrics.FLOW_GROUPS:
+        raise ApiError("box: income or spending")
+    saved = plan_flow(conn)
+    if rows_in is None:
+        saved.pop(box, None)
+    else:
+        if not isinstance(rows_in, list) or not rows_in:
+            raise ApiError("rows: a list of {group, name, amount}, or null for the log's average")
+        clean = []
+        for r in rows_in:
+            group, name = str((r or {}).get("group") or "").strip(), str((r or {}).get("name") or "").strip()
+            if group not in metrics.FLOW_GROUPS[box]:
+                raise ApiError(f"group for {box}: {', '.join(metrics.FLOW_GROUPS[box])}")
+            if not name or len(name) > 60:
+                raise ApiError("every row needs a name (up to 60 characters)")
+            amount = as_num((r or {}).get("amount"), "amount")
+            if amount < 0:
+                raise ApiError("an amount cannot be negative")
+            clean.append({"group": group, "name": name, "amount": amount})
+        saved[box] = clean
+    db.set_setting(conn, "plan_flow", json.dumps(saved))
+    return saved
+
+
+def best_only(who, what):
+    if who is None:
+        raise ApiError("writes need Maki's token or the dashboard page's own session", 401)
+    if who != auth.BEST:
+        raise ApiError(f"{who} may not change {what}; only Best can, from the dashboard", 403)
+
+
+def setting_json(conn, key, kind):
+    try:
+        saved = json.loads(db.get_setting(conn, key) or "null")
+    except ValueError:
+        saved = None
+    return saved if isinstance(saved, kind) else kind()
+
+
+def plan_debts(conn):
+    """The debts of the Plan page's model: [{name, line, balance, as_of, rate, payment}]. `balance` is what was owed in the month
+    `as_of`; `rate` is the yearly interest as a share; `line` names the Fixed-cost line of the Cash flow log that is this payment."""
+    return [d for d in setting_json(conn, "plan_debts", list) if isinstance(d, dict)]
+
+
+def h_plan_debts(conn, body, q, who):
+    """Replace the debts of the Plan page's model: {"debts": [{"name": "House debt", "balance": 2156326, "as_of": "2026-10",
+    "rate": 0.031, "payment": 35000, "line": "House debt"}]}. An empty list removes them all. Best only."""
+    best_only(who, "the plan's debts")
+    items = body.get("debts")
+    if not isinstance(items, list):
+        raise ApiError("debts: a list of {name, balance, as_of, rate, payment, line}")
+    clean, seen = [], set()
+    for d in items:
+        d = d if isinstance(d, dict) else {}
+        name = str(d.get("name") or "").strip()
+        if not name or len(name) > 60 or name.lower() in seen:
+            raise ApiError("every debt needs its own name (up to 60 characters)")
+        seen.add(name.lower())
+        balance, rate, payment = as_num(d.get("balance"), "balance"), as_num(d.get("rate"), "rate"), as_num(d.get("payment"), "payment")
+        if balance < 0:
+            raise ApiError("a balance cannot be negative")
+        if not 0 <= rate <= 1:
+            raise ApiError("rate is the yearly interest as a share: 0.031 means 3.1%")
+        if payment <= 0:
+            raise ApiError("payment is what is paid each month, above 0")
+        as_of = str(d.get("as_of") or date.today().strftime("%Y-%m"))
+        if not re.fullmatch(r"20\d\d-(0[1-9]|1[0-2])", as_of):
+            raise ApiError("as_of is the month the balance is for, like 2026-10")
+        clean.append({"name": name, "line": str(d.get("line") or "").strip()[:60], "balance": balance, "as_of": as_of, "rate": rate, "payment": payment})
+    db.set_setting(conn, "plan_debts", json.dumps(clean))
+    return clean
+
+
+def plan_reinvest(conn):
+    """What the Plan page's model puts into Stock and Trading each month: {"stock", "trading", "freed"}. A missing or null amount
+    means the Cash flow log's average; `freed` also reinvests the payment of a debt once it is paid off."""
+    return setting_json(conn, "plan_reinvest", dict)
+
+
+def h_plan_reinvest(conn, body, q, who):
+    """Set the model's monthly reinvestment: {"stock": 15000, "trading": null, "freed": true}. null = the log's average. Best only."""
+    best_only(who, "the plan's reinvestment")
+    out = {"freed": bool(body.get("freed"))}
+    for key in ("stock", "trading"):
+        if body.get(key) is not None:
+            out[key] = as_num(body[key], key)
+            if out[key] < 0:
+                raise ApiError(f"{key} cannot be negative")
+    db.set_setting(conn, "plan_reinvest", json.dumps(out))
+    return out
 
 
 def h_monthly(conn, body, q, who):
@@ -389,30 +598,41 @@ def bucket_view(conn, bucket):
 def h_investment(conn, body, q, who):
     accounts, months = bucket_view(conn, "investment")
     finished = finished_rows(conn)
-    year = int(finished[-1]["month"][:4]) if finished else date.today().year
+    years = sorted({m["month"][:4] for m in finished if m["investment"]}, reverse=True)
+    asked = (q.get("year") or [None])[0]
+    year = int(asked if asked in years else years[0] if years else (finished[-1]["month"][:4] if finished else date.today().year))
     return {"accounts": accounts, "monthly": months,
             "benchmark": rows(conn, "SELECT as_of, value FROM benchmarks WHERE name='SET' ORDER BY as_of"),
+            "benchmarks": rows(conn, "SELECT id, name, as_of, value FROM benchmarks WHERE name IN ('SET', 'BTC') ORDER BY as_of, name"),
             "stats": metrics.bucket_stats(finished, "investment"),
-            "growth_year": metrics.value_growth_vs_benchmark(conn, finished, start=f"{year - 1}-12", field="investment"),
+            "years": years, "year": str(year),
+            "growth_year": metrics.value_growth_vs_benchmark(conn, finished, start=f"{year - 1}-12", end=f"{year}-12", field="investment"),
             "growth": metrics.value_growth_vs_benchmark(conn, finished, field="investment"),
             "markets": metrics.market_breakdown(conn),
             "flows_recorded_from": db.get_setting(conn, "flows_recorded_from") or None}
+
+
+def journal_view(conn, year=None):
+    """The trade journal's stats and rows (the chart rows cover `year`); stats carry the latest THB-per-USDT rate, so its balance can be shown in THB."""
+    stats = metrics.journal_stats(conn, float(db.get_setting(conn, "journal_start_balance")), year=year,
+                                  start_date=db.get_setting(conn, "journal_start_date"))
+    journal = {"stats": {k: v for k, v in stats.items() if k != "rows"}, "rows": stats["rows"]} if stats else {}
+    if stats:
+        fx = conn.execute("SELECT s.fx_rate, s.as_of FROM snapshots s JOIN accounts a ON a.id = s.account_id "
+                          "WHERE a.bucket='trading' AND a.currency='USDT' ORDER BY s.as_of DESC, s.id DESC LIMIT 1").fetchone()
+        journal["stats"].update(fx=fx["fx_rate"] if fx else None, fx_as_of=fx["as_of"] if fx else None)
+    return journal
 
 
 def h_trading(conn, body, q, who):
     accounts, _ = bucket_view(conn, "trading")
     months = [{k: m[k] for k in ("month", "trading", "trading_flow", "trading_pnl", "trading_pnl_pct",
                                  "flows_known", "stale")} for m in monthly_rows(conn)]
-    stats = metrics.journal_stats(conn, float(db.get_setting(conn, "journal_start_balance")),
-                                  start_date=db.get_setting(conn, "journal_start_date"))
-    journal = {"stats": {k: v for k, v in stats.items() if k != "rows"}, "rows": stats["rows"]} if stats else {}
-    if stats:
-        # the latest THB-per-USDT rate Best entered with a Monthly value, to show the journal balance in THB
-        fx = conn.execute("SELECT s.fx_rate, s.as_of FROM snapshots s JOIN accounts a ON a.id = s.account_id "
-                          "WHERE a.bucket='trading' AND a.currency='USDT' ORDER BY s.as_of DESC, s.id DESC LIMIT 1").fetchone()
-        journal["stats"].update(fx=fx["fx_rate"] if fx else None, fx_as_of=fx["as_of"] if fx else None)
+    journal = journal_view(conn, journal_year(conn, q))
     return {"accounts": accounts, "monthly": months, "journal": metrics.trade_stats(conn),
             "stats": journal.get("stats"),
+            "journal_source": journal_source(conn),
+            "benchmarks": rows(conn, "SELECT id, name, as_of, value FROM benchmarks WHERE name IN ('SET', 'BTC') ORDER BY as_of, name"),
             "trades": rows(conn, "SELECT * FROM trades ORDER BY traded_on DESC, id DESC LIMIT 200"),
             "sheet": metrics.journal_sheet(conn, float(db.get_setting(conn, "journal_start_balance")),
                                            float(db.get_setting(conn, "journal_risk_pct")), journal_year(conn, q)),
@@ -444,6 +664,63 @@ def h_journal_grades(conn, body, q, who):
         raise ApiError("each grade note must be 80 characters or fewer")
     db.set_setting(conn, "journal_grade_notes", json.dumps(notes, ensure_ascii=False))
     return notes
+
+
+def journal_source(conn):
+    """The journal workbook the trades are mirrored from: when it was saved, when the dashboard last read it, and whether it changed since."""
+    path = CFG["journal_workbook_path"]
+    synced = db.get_setting(conn, "journal_synced_at") or None
+    try:
+        saved = datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M:%S")
+    except OSError:
+        saved = None
+    return {"file": os.path.basename(path), "exists": saved is not None, "saved_at": saved, "synced_at": synced,
+            "stale": bool(saved and (not synced or saved > synced))}
+
+
+def h_journal_sync(conn, body, q, who):
+    """Read the journal workbook again and make the trades match it exactly (Excel is the source). Best only."""
+    if who is None:
+        raise ApiError("writes need Maki's token or the dashboard page's own session", 401)
+    if who != auth.BEST:
+        raise ApiError(f"{who} may not sync the journal; only Best can, from the dashboard", 403)
+    path = CFG["journal_workbook_path"]
+    if not os.path.exists(path):
+        raise ApiError(f"the journal workbook was not found: {path}", 404)
+    try:
+        trades = journal_file.parse(path)
+    except Exception as e:           # a locked, half-saved or renamed-sheet workbook; nothing is changed
+        raise ApiError(f"could not read the journal workbook ({e}); nothing was changed") from e
+    if not trades:
+        raise ApiError("the journal sheet has no trades, so nothing was changed")
+    conn.commit()
+    if not backup.has_backup_today(CFG["backup_dir"]) or conn.execute("SELECT 1 FROM trades WHERE source_row IS NULL LIMIT 1").fetchone():
+        backup.make_backup(CFG["db_path"], CFG["backup_dir"], "pre-journal-sync")      # the trades about to be replaced
+    added, removed = journal_file.mirror(conn, trades)
+    db.set_setting(conn, "journal_synced_at", db.now())
+    conn.commit()
+    return {"trades": len(trades), "added": added, "removed": removed, "source": journal_source(conn)}
+
+
+def open_workbook(who, key, what):
+    """Open a configured workbook in Excel on this machine. Best only; the path is the configured one, never a request value."""
+    if who != auth.BEST:
+        raise ApiError(f"only Best can open the {what}, from the dashboard", 403 if who else 401)
+    path = CFG[key]
+    if not os.path.exists(path):
+        raise ApiError(f"the {what} was not found: {path}", 404)
+    if not hasattr(os, "startfile"):
+        raise ApiError("opening the workbook needs Windows", 400)
+    os.startfile(path)
+    return {"opened": os.path.basename(path)}
+
+
+def h_journal_open(conn, body, q, who):
+    return open_workbook(who, "journal_workbook_path", "journal workbook")
+
+
+def h_fund_open(conn, body, q, who):
+    return open_workbook(who, "fund_workbook_path", "Fund Management workbook")
 
 
 def h_journal_settings(conn, body, q, who):
@@ -623,6 +900,45 @@ def lister(resource):
     return handler
 
 
+# A Reinvest line in the Cash flow log (section allocation, the line names where the money went) is also the deposit into that
+# place, so the tab it goes to shows it too. Saving Cash is the Family Statement ledger and Other has no Account: nothing to mirror.
+def reinvest_account(conn, destination):
+    if destination in ("Stock", "Investment"):                        # the old name still maps
+        sql, args = "SELECT * FROM accounts WHERE bucket='investment' AND source='manual' ORDER BY id LIMIT 1", ()
+    elif destination == "Trading":
+        sql, args = "SELECT * FROM accounts WHERE bucket='trading' AND source='manual' ORDER BY (currency='USDT') DESC, id LIMIT 1", ()
+    elif destination == "Saving Bitcoin":
+        sql, args = "SELECT * FROM accounts WHERE bucket='wealth' AND source='manual' AND name IN ('Bitcoin', 'BTC') ORDER BY id LIMIT 1", ()
+    else:
+        return None
+    return conn.execute(sql, args).fetchone()
+
+
+def sync_reinvest(conn, who, line, gone=None):
+    """Bring the Flow behind a Reinvest line in step with it. `line` is the line as it is now (None once deleted) and `gone` the
+    deleted row. Returns the name of the Account that received the deposit, or None. Every change is logged and can be undone."""
+    src = line or gone
+    flow = audit.row(conn, "flows", src["flow_id"]) if src and src.get("flow_id") else None
+    account = reinvest_account(conn, line["line"]) if line and line["section"] == "allocation" and line["amount_thb"] else None
+    if account is None:
+        if flow:
+            audit.delete(conn, who, "flows", flow["id"])
+        if line and line.get("flow_id"):
+            conn.execute("UPDATE cashflow_lines SET flow_id=NULL WHERE id=?", (line["id"],))
+        return None
+    month = line["month"]
+    year, mon = int(month[:4]), int(month[5:7])
+    day = date.today().isoformat() if month == date.today().strftime("%Y-%m") else f"{month}-{calendar.monthrange(year, mon)[1]:02d}"
+    vals = clean_flow(conn, {"account_id": account["id"], "on_date": day, "amount_thb": line["amount_thb"], "kind": None,
+                             "note": "Cash flow log · Reinvest"}, flow, who)
+    if flow:
+        audit.update(conn, who, "flows", flow["id"], vals)
+    else:
+        flow_id, _ = audit.insert(conn, who, "flows", vals)
+        conn.execute("UPDATE cashflow_lines SET flow_id=? WHERE id=?", (flow_id, line["id"]))
+    return account["name"]
+
+
 def creator(resource):
     table, clean, _, _ = RESOURCES[resource]
 
@@ -636,7 +952,10 @@ def creator(resource):
                 raise ApiError(f"a Snapshot for this Account on {vals['as_of']} already exists "
                                f"(id {dup['id']}); update it with PUT /api/snapshots/{dup['id']}", 409)
         row_id, audit_id = audit.insert(conn, who, table, vals)
-        return {"id": row_id, "audit_id": audit_id}
+        out = {"id": row_id, "audit_id": audit_id}
+        if table == "cashflow_lines":
+            out["deposit_to"] = sync_reinvest(conn, who, audit.row(conn, table, row_id))
+        return out
     return handler
 
 
@@ -648,7 +967,10 @@ def updater(resource):
         old = audit.row(conn, table, int(row_id))
         if old is None:
             raise ApiError(f"{resource} {row_id} not found", 404)
-        return {"id": int(row_id), "audit_id": audit.update(conn, who, table, int(row_id), clean(conn, body, old, who))}
+        out = {"id": int(row_id), "audit_id": audit.update(conn, who, table, int(row_id), clean(conn, body, old, who))}
+        if table == "cashflow_lines":
+            out["deposit_to"] = sync_reinvest(conn, who, audit.row(conn, table, int(row_id)))
+        return out
     return handler
 
 
@@ -657,10 +979,30 @@ def deleter(resource):
 
     def handler(conn, body, q, who, row_id):
         may_write(who, resource)
-        if audit.row(conn, table, int(row_id)) is None:
+        old = audit.row(conn, table, int(row_id))
+        if old is None:
             raise ApiError(f"{resource} {row_id} not found", 404)
-        return {"id": int(row_id), "audit_id": audit.delete(conn, who, table, int(row_id))}
+        out = {"id": int(row_id), "audit_id": audit.delete(conn, who, table, int(row_id))}
+        if table == "cashflow_lines":
+            sync_reinvest(conn, who, None, gone=old)
+        return out
     return handler
+
+
+def h_account_delete(conn, body, q, who, row_id):
+    """Delete a Wealth Card: its Account with every Snapshot and Flow. Best only. Each row is logged, so History can undo it."""
+    may_write(who, "accounts")
+    acc = audit.row(conn, "accounts", int(row_id))
+    if acc is None:
+        raise ApiError(f"accounts {row_id} not found", 404)
+    if acc["bucket"] != "wealth":
+        raise ApiError("only a Wealth Card can be deleted here; set an Account inactive or keep it")
+    removed = {"snapshots": 0, "flows": 0}
+    for table in removed:
+        for r in conn.execute(f"SELECT id FROM {table} WHERE account_id=?", (acc["id"],)).fetchall():
+            audit.delete(conn, who, table, r["id"])
+            removed[table] += 1
+    return {"id": acc["id"], "audit_id": audit.delete(conn, who, "accounts", acc["id"]), "removed": removed}
 
 
 def h_audit(conn, body, q, who):
@@ -694,7 +1036,16 @@ ROUTES = [
     ("GET", r"/api/investment", h_investment),
     ("GET", r"/api/trading", h_trading),
     ("GET", r"/api/wealth", h_wealth),
+    ("GET", r"/api/plan", h_plan),
+    ("GET", r"/api/goal-bars", h_goal_bars),
+    ("POST", r"/api/journal/sync", h_journal_sync),
+    ("POST", r"/api/journal/open", h_journal_open),
+    ("POST", r"/api/fund/open", h_fund_open),
     ("GET", r"/api/family", h_family),
+    ("PUT", r"/api/plan/yields", h_plan_yields),
+    ("PUT", r"/api/plan/flow", h_plan_flow),
+    ("PUT", r"/api/plan/debts", h_plan_debts),
+    ("PUT", r"/api/plan/reinvest", h_plan_reinvest),
     ("PUT", r"/api/journal/settings", h_journal_settings),
     ("PUT", r"/api/journal/grades", h_journal_grades),
     ("GET", r"/api/avatar", h_avatar),
@@ -705,6 +1056,7 @@ ROUTES = [
     ("GET", r"/api/accounts", h_accounts),
     ("POST", r"/api/accounts", h_account_create),
     ("PUT", r"/api/accounts/(\d+)", updater("accounts")),
+    ("DELETE", r"/api/accounts/(\d+)", h_account_delete),
     ("GET", r"/api/audit", h_audit),
     ("POST", r"/api/audit/(\d+)/undo", h_audit_undo),
     ("POST", r"/api/backup", h_backup),

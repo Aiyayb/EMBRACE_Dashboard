@@ -57,10 +57,11 @@ CREATE TABLE IF NOT EXISTS benchmarks (
 CREATE TABLE IF NOT EXISTS cashflow_lines (
     id         INTEGER PRIMARY KEY,
     month      TEXT NOT NULL,                        -- YYYY-MM
-    section    TEXT NOT NULL CHECK (section IN ('income', 'fixed_cost', 'allocation')),
+    section    TEXT NOT NULL CHECK (section IN ('income', 'fixed_cost', 'expense', 'allocation')),
     line       TEXT NOT NULL,
     amount_thb REAL NOT NULL,
     note       TEXT,
+    flow_id    INTEGER,                              -- a Reinvest line's deposit in the destination Account (kept in step by the server)
     entered_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE (month, section, line)
@@ -117,6 +118,9 @@ CREATE TABLE IF NOT EXISTS goals (
     name     TEXT NOT NULL,                          -- Stock | Trading | Saving | EMC | OnTheWall
     bucket   TEXT CHECK (bucket IN ('investment', 'trading', 'wealth')),  -- NULL = outside Total Portfolio Value
     goal_thb REAL NOT NULL,
+    monthly_thb REAL,                                -- the plan's monthly reinvestment into it (for OnTheWall: the monthly income aimed at)
+    growth_pct  REAL,                                -- growth the plan counts on for the year, as a share (0.15 = 15%)
+    note        TEXT,                                -- Best's action plan for the Goal, in his own words
     UNIQUE (year, name)
 );
 

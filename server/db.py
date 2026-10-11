@@ -9,6 +9,11 @@ GRADE_NOTES = {"A": "Follow Con · Exit Plan or Plus", "B": "Follow Con · Can�
 
 DEFAULT_SETTINGS = {
     "shop_dividend_split_onn": "0.6",     # the shop's dividend: ออน gets this share of the pool, เบส the rest
+    # what the plan counts on Investment returning in a year (the plan sheet's "Yield 15%" for Stock and "Yield 50%" for Trading)
+    "plan_yield_stock": "0.15",
+    "plan_yield_trading": "0.5",
+    "plan_birth_year": "",                # Best's birth year, so the Plan can show his age beside each year (set by import_plan_actions.py)
+    "journal_synced_at": "",              # when the trades were last mirrored from the journal workbook
     "journal_start_balance": "980",      # the journal sheet's Start cell (USDT)
     "journal_start_date": "2026-01-01",   # the day the journal's Start balance was in the account; CAGR counts from here
     "journal_risk_pct": "0.1",           # Risk Per Trade, as a share of Net Balance
@@ -59,6 +64,11 @@ def init(conn):
     old_benchmarks = bool(_columns(conn, "benchmarks")) and "id" not in _columns(conn, "benchmarks")
     if old_benchmarks:
         conn.execute("ALTER TABLE benchmarks RENAME TO benchmarks_old")
+    # cashflow_lines gained the 'expense' section; its CHECK cannot be altered, so rebuild a table made before that
+    cf = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='cashflow_lines'").fetchone()
+    old_cashflow = bool(cf) and "'expense'" not in cf[0]
+    if old_cashflow:
+        conn.execute("ALTER TABLE cashflow_lines RENAME TO cashflow_lines_old")
     if _columns(conn, "accounts") and "allocation" not in _columns(conn, "accounts"):
         conn.execute("ALTER TABLE accounts ADD COLUMN allocation TEXT")
         conn.execute("UPDATE accounts SET allocation = CASE WHEN name IN ('EMC', 'Family Statement') THEN 'emc' "
@@ -68,6 +78,12 @@ def init(conn):
         for col, kind in TRADE_COLUMNS:
             if col not in have:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {kind}")
+    if _columns(conn, "cashflow_lines") and "flow_id" not in _columns(conn, "cashflow_lines"):
+        conn.execute("ALTER TABLE cashflow_lines ADD COLUMN flow_id INTEGER")
+    if _columns(conn, "goals"):
+        for col, kind in (("monthly_thb", "REAL"), ("growth_pct", "REAL"), ("note", "TEXT")):
+            if col not in _columns(conn, "goals"):
+                conn.execute(f"ALTER TABLE goals ADD COLUMN {col} {kind}")
     if _columns(conn, "snapshots") and "holdings" not in _columns(conn, "snapshots"):
         conn.execute("ALTER TABLE snapshots ADD COLUMN holdings TEXT")
     with open(SCHEMA_PATH, encoding="utf-8") as f:
@@ -75,6 +91,10 @@ def init(conn):
     if old_benchmarks:
         conn.execute("INSERT INTO benchmarks(name, as_of, value) SELECT name, as_of, value FROM benchmarks_old")
         conn.execute("DROP TABLE benchmarks_old")
+    if old_cashflow:
+        conn.execute("INSERT INTO cashflow_lines(id, month, section, line, amount_thb, note, entered_by, created_at) "
+                     "SELECT id, month, section, line, amount_thb, note, entered_by, created_at FROM cashflow_lines_old")
+        conn.execute("DROP TABLE cashflow_lines_old")
     for k, v in DEFAULT_SETTINGS.items():
         conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v))
     if conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0:
@@ -82,10 +102,6 @@ def init(conn):
             "INSERT INTO accounts(name, bucket, currency, counts_in_total, source, allocation, created_at) "
             "VALUES (?,?,?,?,?,?,?)",
             [(*a, now()) for a in DEFAULT_ACCOUNTS])
-    for name in ("Discord", "Telegram"):
-        conn.execute("INSERT OR IGNORE INTO links(name, url, updated_at) VALUES (?, '', ?)", (name, now()))
-    for name in ("Discord", "Telegram"):
-        conn.execute("INSERT OR IGNORE INTO links(name, url, updated_at) VALUES (?, '', ?)", (name, now()))
     for name in ("Discord", "Telegram"):
         conn.execute("INSERT OR IGNORE INTO links(name, url, updated_at) VALUES (?, '', ?)", (name, now()))
     conn.commit()
