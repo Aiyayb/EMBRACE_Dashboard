@@ -422,9 +422,11 @@ function donut(host, parts, center) {
 const GROUPS = {investment: ['Stock', 'var(--mint)', 'investment'], trading: ['Trading', 'var(--ink)', 'trading'],
   saving: ['Bitcoin', 'var(--tan-light)', 'wealth'], emc: ['Cash', 'var(--tan)', 'wealth']};     // shown as Cash (Family Statement) and Bitcoin (Crypto)
 
-function tile(label, value, delta, valueSign, sub, change) {
+function tile(label, value, delta, valueSign, sub, change, badge) {
   // change: the same move in baht, shown between the % and the caption ("−1.1%  −฿11,192  MoM")
-  return h('article', {class: 'card'},
+  // badge: a small box in the top right corner (the FX rate on the Trading tiles)
+  return h('article', {class: 'card', style: badge ? 'position:relative' : null},
+    badge ? h('span', {class: 'chip', style: 'position:absolute;top:10px;right:10px;font-size:11px'}, badge) : null,
     h('div', {class: 'tile-label'}, label),
     h('div', {class: `tile-value ${valueSign == null ? '' : signClass(valueSign)}`}, value),
     delta === undefined ? (sub ? h('div', {class: 'tile-sub'}, sub) : null)
@@ -469,17 +471,20 @@ function performanceCard({year, rowsYear, rowsAll, nameYear, nameAll, legend, be
 // Monthly Return, YTD and CAGR of a Bucket: change in value with deposits counted (see metrics.bucket_stats)
 const usdt = (v) => (v == null ? '—' : (v < 0 ? '−' : '') + Math.abs(v).toLocaleString('en', {minimumFractionDigits: 2, maximumFractionDigits: 2}));
 
-function bucketStatTiles(st, {fmt = baht, cagrNote = 'deposits counted'} = {}) {
+const prevMonth = (m) => { const y = Number(m.slice(0, 4)), n = Number(m.slice(5, 7)); return n === 1 ? `${y - 1}-12` : `${y}-${String(n - 1).padStart(2, '0')}`; };
+
+function bucketStatTiles(st, {fmt = baht, cagrNote = 'deposits counted', badge, drawdown} = {}) {
   if (!st) return [];
   const abbr = (short, full) => h('span', null, short, h('span', {class: 'tile-abbr'}, full));
   const dec = `Dec ${Number(st.month.slice(0, 4)) - 1}`;
   return [
-    tile('Monthly Return', fmt(st.monthly_amount), st.monthly_pct, st.monthly_amount),
-    tile(abbr('YTD', 'Year to date'), fmt(st.ytd_amount), st.ytd_pct, st.ytd_amount, `since ${dec} close`),
+    tile('Monthly Return', fmt(st.monthly_amount), st.monthly_pct, st.monthly_amount, undefined, undefined, badge),
+    tile(abbr('YTD', 'Year to date'), fmt(st.ytd_amount), st.ytd_pct, st.ytd_amount, `since ${dec} close`, undefined, badge),
     tile(abbr('CAGR', 'Compound annual growth rate'), st.cagr == null ? '—' : signedPct(st.cagr), undefined, st.cagr,
       st.cagr == null ? (st.cagr_months === undefined ? `needs 12 months of history (since ${monthLabel(st.cagr_since)})` : `needs 3 months of trades (since ${monthLabel(st.cagr_since)})`)
         : st.cagr_months != null && st.cagr_months < 12 ? h('span', {title: `Annualised from ${st.cagr_months} months, not a full year`}, `since ${monthLabel(st.cagr_since)}`)
-        : `since ${monthLabel(st.cagr_since)} · ${cagrNote}`)];
+        : `since ${monthLabel(st.cagr_since)} · ${cagrNote}`),
+    ...(drawdown && st.mdd != null ? [tile('Max Drawdown', st.mdd ? `−${pct(st.mdd)}` : '0.0%', st.mdd - st.mdd_prev, st.mdd, `vs ${monthLabel(prevMonth(st.month))} (${st.mdd_prev ? `−${pct(st.mdd_prev)}` : '0.0%'})`)] : [])];
 }
 
 // tabs (optional): the year tabs at the top right; the note then drops to its own line
@@ -1576,9 +1581,10 @@ const pages = {
       goalStrip(d.sheet.year, [{name: 'Trading', label: 'Trading'}]),
       h('div', {class: 'tiles'},
         d.stats ? (d.stats.fx
-          ? tile('Trading Portfolio', baht(d.stats.value * d.stats.fx), undefined, undefined, `${usdt(d.stats.value)} USDT × ${number(d.stats.fx)} (FX ${yymm(d.stats.fx_as_of)})`)
+          ? tile('Trading Portfolio', baht(d.stats.value * d.stats.fx), undefined, undefined, `${usdt(d.stats.value)} USDT × ${number(d.stats.fx)} (FX ${yymm(d.stats.fx_as_of)})`, undefined, `฿${number(d.stats.fx)}/USDT`)
           : tile('Trading Portfolio', `${usdt(d.stats.value)} USDT`, undefined, undefined, 'Net Balance · no FX rate entered yet')) : null,
-        ...bucketStatTiles(d.stats, {fmt: usdt, cagrNote: 'trades only'})));
+        ...bucketStatTiles(d.stats, {fmt: d.stats && d.stats.fx ? (v) => (v == null ? '—' : baht(v * d.stats.fx)) : usdt,
+          badge: d.stats && d.stats.fx ? `฿${number(d.stats.fx)}/USDT` : undefined, cagrNote: 'trades only', drawdown: true})));
 
     // the journal's summary block and sheet share one reload, so an edit in a cell updates both
     const summaryHost = h('div');

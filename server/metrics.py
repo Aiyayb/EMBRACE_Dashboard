@@ -330,6 +330,16 @@ def journal_stats(conn, start, year=None, start_date=None):
              "ytd_amount": _r(net - ytd_open), "ytd_pct": net / ytd_open - 1 if ytd_open else None,
              "cagr": (net / start) ** (365.25 / days) - 1 if start and days >= 90 else None,
              "cagr_months": round(days / 30.44) if days >= 90 else None, "cagr_since": first_day[:7]}
+    # Max Drawdown: the worst fall from the running peak of the journal balance (trade by trade, peak carried across
+    # months) inside the month; `mdd_prev` is the same for the month before, so the tile can show the change.
+    bal, peak, mdd = start, start, {}
+    for t in trades:
+        bal += t["pnl"]
+        peak = max(peak, bal)
+        m = t["traded_on"][:7]
+        mdd[m] = min(mdd.get(m, 0.0), bal / peak - 1 if peak else 0.0)
+    stats["mdd"] = mdd.get(last, 0.0)
+    stats["mdd_prev"] = mdd.get(prev_month, 0.0)
     levels = {}
     for b in conn.execute("SELECT as_of, value FROM benchmarks WHERE name='BTC' ORDER BY as_of"):
         levels[b["as_of"][:7]] = b["value"]
