@@ -174,6 +174,42 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("bars", out)
 
+    def test_stock_and_trading_bars_move_with_what_is_entered_this_month(self):
+        from datetime import date, timedelta
+        today = date.today().isoformat()
+        stocks, okx = self.account_id("Stocks"), self.account_id("OKX Trading")
+        ui = {"cookie": auth.UI_KEY}
+        made = {"snapshots": [], "goals": [], "trades": []}
+
+        def add(kind, path, body):
+            row = self.call("POST", path, body, **ui)[1]
+            made[kind].append(row["id"])
+            return row
+        bars = lambda: self.call("GET", "/api/goal-bars")[1]["bars"]                                                # noqa: E731
+        try:
+            last_month_end = date.today().replace(day=1) - timedelta(days=1)
+            year = last_month_end.year
+            add("snapshots", "/api/snapshots", {"account_id": stocks, "as_of": last_month_end.isoformat(), "value_native": 100})   # a finished month
+            add("goals", "/api/goals", {"year": year, "name": "Stock", "bucket": "investment", "goal_thb": 1000})
+            add("goals", "/api/goals", {"year": year, "name": "Trading", "bucket": "trading", "goal_thb": 100000})
+            self.assertEqual(bars()["Stock"]["actual_thb"], 100)
+            row = add("snapshots", "/api/snapshots", {"account_id": stocks, "as_of": today, "value_native": 400})    # the month still running
+            self.assertEqual(bars()["Stock"]["actual_thb"], 400)
+            self.call("PUT", f"/api/snapshots/{row['id']}", {"value_native": 700}, **ui)                               # an edit moves it
+            self.assertEqual(bars()["Stock"]["actual_thb"], 700)
+            # Trading follows the journal's Net Balance at the latest USDT rate, the figure the Trading Portfolio tile shows
+            add("snapshots", "/api/snapshots", {"account_id": okx, "as_of": today, "value_native": 1000, "fx_rate": 30})
+            add("trades", "/api/trades", {"traded_on": today, "pair": "BTC/USDT", "pnl": 50})
+            stats = self.call("GET", "/api/trading")[1]["stats"]
+            self.assertEqual(bars()["Trading"]["actual_thb"], round(stats["value"] * stats["fx"], 2))
+            before = bars()["Trading"]["actual_thb"]
+            add("trades", "/api/trades", {"traded_on": today, "pair": "ETH/USDT", "pnl": 20})
+            self.assertEqual(bars()["Trading"]["actual_thb"], round(before + 20 * stats["fx"], 2))
+        finally:
+            for kind, path in (("trades", "trades"), ("snapshots", "snapshots"), ("goals", "goals")):
+                for i in made[kind]:
+                    self.call("DELETE", f"/api/{path}/{i}", **ui)
+
     def test_plan_flow_rows_are_best_only_and_leave_the_log_alone(self):
         rows = [{"group": "Active", "name": "Salary", "amount": 120000}, {"group": "Investment", "name": "Stock", "amount": 5000}]
         body = {"box": "income", "rows": rows}
@@ -279,18 +315,28 @@ class ApiTest(unittest.TestCase):
         self.call("POST", f"/api/audit/{gone['audit_id']}/undo", cookie=auth.UI_KEY)
         self.assertTrue([p for p in self.call("GET", "/api/projects")[1] if p["id"] == made["id"]])
 
-    def test_home_reports_the_last_finished_month(self):
+    def test_home_totals_are_live_and_its_charts_stay_on_finished_months(self):
         from datetime import date
         acc = self.account_id("Stocks")
         this_month = date.today().strftime("%Y-%m")
+        made = []
         for as_of, value in (("2020-01-31", 100000), ("2020-02-29", 110000), (this_month + "-01", 999999)):
-            status, _ = self.call("POST", "/api/snapshots", {"account_id": acc, "as_of": as_of, "value_native": value},
-                                  cookie=auth.UI_KEY)
+            status, row = self.call("POST", "/api/snapshots", {"account_id": acc, "as_of": as_of, "value_native": value},
+                                    cookie=auth.UI_KEY)
             self.assertEqual(status, 200)
-        home = self.call("GET", "/api/home")[1]
-        self.assertLess(home["kpis"]["month"], this_month)
-        self.assertNotEqual(home["kpis"]["investment"], 999999)
-        self.assertEqual(self.call("GET", "/api/monthly")[1][-1]["month"], this_month)   # still listed in full
+            made.append(row["id"])
+        try:
+            home = self.call("GET", "/api/home")[1]
+            self.assertLess(home["monthly"][-1]["month"], this_month)                         # the charts and returns keep to finished months
+            self.assertEqual(home["kpis"]["month"], this_month)                               # the tiles say where things stand now
+            self.assertEqual(home["kpis"]["investment"], 999999)
+            self.assertGreaterEqual(home["kpis"]["total"], 999999)
+            self.assertIsNone(home["kpis"]["return_after_flows"])                             # a month still running has no return after flows
+            self.assertEqual(self.call("GET", "/api/networth")[1]["portfolio_thb"], home["kpis"]["total"])    # Net Worth starts from the same total
+            self.assertEqual(self.call("GET", "/api/monthly")[1][-1]["month"], this_month)   # still listed in full
+        finally:                                                                              # the database is shared by the tests
+            for i in made:
+                self.call("DELETE", f"/api/snapshots/{i}", cookie=auth.UI_KEY)
 
     def test_only_best_changes_the_profile_photo(self):
         photo = "data:image/jpeg;base64,/9j/4AAQSkZJRg=="

@@ -154,6 +154,30 @@ def _diff(cur, prev):
     return None if cur is None or prev is None else round(cur - prev, 2)
 
 
+def live_row(prev, month, accounts, values, trading_override=None, net_flow=0.0):
+    """The month in progress as it stands now, after the last finished row `prev`: each counted Account at the value in `values`
+    ({account_id: value_thb}; an Account with none is left out), the trading Accounts replaced by `trading_override` (the journal's
+    Net Balance in baht) when given. Total Portfolio Value is summed here like everywhere else. Flows of a month still running are
+    only partly entered, so no return after flows or trading P&L is stated for it; the change in value (deposits counted) is."""
+    row = {"month": month, "investment": 0.0, "trading": 0.0, "wealth": 0.0, "total": 0.0, "net_flow": net_flow, "trading_flow": 0.0,
+           "stale": [], "by_account": [], "flows_known": False, "live": True}
+    entries = [(a["id"], a["name"], a["bucket"], group_of(a), values[a["id"]]) for a in accounts
+               if a["counts_in_total"] and values.get(a["id"]) is not None]
+    if trading_override is not None:
+        entries = [e for e in entries if e[2] != "trading"] + [(None, "Trading Portfolio (journal)", "trading", "trading", trading_override)]
+    for acc_id, name, bucket, group, value in entries:
+        row[bucket] += value
+        row["total"] += value
+        row["by_account"].append({"account_id": acc_id, "account": name, "bucket": bucket, "group": group,
+                                  "value_thb": _r(value), "as_of": None, "stale": False})
+    row["growth_thb"] = row["total"] - prev["total"] if prev else None
+    row["growth_pct"] = row["growth_thb"] / prev["total"] if prev and prev["total"] else None
+    row["return_thb"] = row["return_pct"] = row["trading_pnl"] = row["trading_pnl_pct"] = None
+    for k in ("investment", "trading", "wealth", "total", "net_flow", "growth_thb"):
+        row[k] = _r(row[k])
+    return row
+
+
 def kpis(rows, shop_months):
     """Home tiles: the latest month against the month before it."""
     if not rows:
