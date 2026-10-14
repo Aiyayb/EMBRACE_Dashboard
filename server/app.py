@@ -358,19 +358,43 @@ def finished_rows(conn):
     return [m for m in months if m["month"] < this_month] or months
 
 
+def live_rows(conn):
+    """finished_rows plus one row for the month in progress as it stands now (metrics.live_row): every counted Account at its latest
+    Snapshot, the Family Statement at its ledger balance, Trading at the journal figure the Trading Portfolio tile shows. Used for
+    the figures that say where things stand today (Total Portfolio Value, Allocation, the year's target, Net Worth); the charts and
+    returns keep to finished months."""
+    finished = finished_rows(conn)
+    this_month = date.today().strftime("%Y-%m")
+    if not finished or finished[-1]["month"] >= this_month:
+        return finished
+    accounts = metrics.latest_values(conn)
+    values = {a["id"]: a["snapshot"]["value_thb"] for a in accounts if a["snapshot"] and a["source"] == "manual"}
+    fam = family.ledger(CFG["family_xlsx_path"])
+    if fam.get("available") and fam.get("balance") is not None:
+        values.update({a["id"]: fam["balance"] for a in accounts if a["source"] == "family_statement"})
+    live = live_values(conn).get("trading")
+    in_progress = next((m for m in monthly_rows(conn) if m["month"] == this_month), None)
+    return finished + [metrics.live_row(finished[-1], this_month, accounts, values, live[0] if live else None,
+                                        in_progress["net_flow"] if in_progress else 0.0)]
+
+
 def h_home(conn, body, q, who):
     months = finished_rows(conn)
+    now = live_rows(conn)           # the same months plus the one in progress, for the figures that say where things stand today
     shop_data = shop_months(conn)
     year = int(months[-1]["month"][:4]) if months else date.today().year
+    kpis = metrics.kpis(now, shop_data["months"])
+    if kpis and now is not months:  # the shop's revenue is a monthly figure: keep the last finished month's
+        kpis.update({k: v for k, v in metrics.kpis(months, shop_data["months"]).items() if k.startswith("shop_")})
     return {
-        "kpis": metrics.kpis(months, shop_data["months"]),
+        "kpis": kpis,
         "monthly": months,
         "performance": metrics.performance(conn, months),
         "growth": metrics.value_growth_vs_benchmark(conn, months),
         # this year's growth in Total Portfolio Value, deposits included, from the previous December's close
         "growth_year": metrics.value_growth_vs_benchmark(conn, months, start=f"{int(months[-1]['month'][:4]) - 1}-12") if months else [],
-        "allocation": metrics.allocation(months),
-        "goals": metrics.goal_progress(conn, months, year),
+        "allocation": metrics.allocation(now),
+        "goals": metrics.goal_progress(conn, now, year),
         "upcoming": rows(conn, "SELECT * FROM upcoming_items WHERE done=0 ORDER BY due_date, id LIMIT 8"),
         "projects": rows(conn, "SELECT * FROM projects ORDER BY name"),
         "shop": {"available": shop_data["available"], "reason": shop_data["reason"]},
@@ -387,9 +411,9 @@ def h_plan(conn, body, q, who):
         income["OnTheWall"] = {y["year"]: round(sum(m["dividend_pool"] or 0 for m in y["months"]), 2) for y in years}
     except Exception:           # the shop figures are a comparison, never a reason for the Plan not to load
         traceback.print_exc()
-    out = metrics.plan_view(conn, finished_rows(conn), income) or {}
+    out = metrics.plan_view(conn, live_rows(conn), income) or {}
     if out.get("this_year"):
-        live = live_saving(conn)
+        live = live_values(conn)
         for item in out["this_year"]["items"]:
             now = live.get(item["group"])
             if now is not None and item["goal_thb"]:
@@ -400,13 +424,28 @@ def h_plan(conn, body, q, who):
     return out
 
 
-def live_saving(conn):
-    """The two Saving Goals are measured by the cards on the Saving page as they stand now, not by the last month end:
-    Saving Cash is the Family Statement ledger's balance, Saving Bitcoin the Bitcoin card's latest value. {group: (value, as_of)}"""
+def live_values(conn):
+    """Where each Allocation Group stands now, not at the last month end, so a figure entered this month moves the Goal bars the
+    moment it is saved. {group: (value_thb, as_of)}; a group with nothing to read is left out.
+    Stock: the latest Snapshot of its Accounts, this month's included. Trading: the same figure as the Trading Portfolio tile (the
+    journal's Net Balance at the latest USDT rate), else the latest Snapshots. Saving Cash is the Family Statement ledger's
+    balance and Saving Bitcoin the Bitcoin card's latest value."""
     fam = family.ledger(CFG["family_xlsx_path"])
-    live = {"emc": (fam["balance"], fam["last_date"]) if fam.get("available") and fam.get("balance") is not None else None}
-    coin = next((a for a in metrics.latest_values(conn) if a["bucket"] == "wealth" and a["name"] in ("Bitcoin", "BTC")), None)
-    live["saving"] = (coin["snapshot"]["value_thb"], coin["snapshot"]["as_of"]) if coin and coin["snapshot"] else (0.0, None) if coin else None
+    live = {}
+    if fam.get("available") and fam.get("balance") is not None:
+        live["emc"] = (fam["balance"], fam["last_date"])
+    accounts = metrics.latest_values(conn)
+    coin = next((a for a in accounts if a["bucket"] == "wealth" and a["name"] in ("Bitcoin", "BTC")), None)
+    if coin:
+        live["saving"] = (coin["snapshot"]["value_thb"], coin["snapshot"]["as_of"]) if coin["snapshot"] else (0.0, None)
+    for group in ("investment", "trading"):
+        snaps = [a["snapshot"] for a in accounts if a["bucket"] == group and a["snapshot"]]
+        if snaps:
+            live[group] = (sum(x["value_thb"] for x in snaps), max(x["as_of"] for x in snaps))
+    stats = journal_view(conn).get("stats")
+    if stats and stats.get("fx"):
+        last = conn.execute("SELECT MAX(traded_on) FROM trades").fetchone()[0]
+        live["trading"] = (stats["value"] * stats["fx"], last)
     return live
 
 
@@ -427,7 +466,7 @@ def h_goal_bars(conn, body, q, who):
     by = {r["month"]: r for r in finished}
     ref = by.get(f"{year}-12") or (latest if latest["month"][:4] == str(year) else None)
     values = metrics.group_values(ref) if ref else {}
-    live = live_saving(conn) if ref is latest else {}
+    live = live_values(conn) if ref is latest else {}
     bars = {}
     for g in conn.execute("SELECT * FROM goals WHERE year=?", (year,)):
         name = g["name"]
@@ -586,7 +625,7 @@ def h_monthly(conn, body, q, who):
 
 
 def h_networth(conn, body, q, who):
-    return metrics.net_worth(conn, finished_rows(conn))
+    return metrics.net_worth(conn, live_rows(conn))
 
 
 def bucket_view(conn, bucket):

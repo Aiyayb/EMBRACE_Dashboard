@@ -154,6 +154,30 @@ def _diff(cur, prev):
     return None if cur is None or prev is None else round(cur - prev, 2)
 
 
+def live_row(prev, month, accounts, values, trading_override=None, net_flow=0.0):
+    """The month in progress as it stands now, after the last finished row `prev`: each counted Account at the value in `values`
+    ({account_id: value_thb}; an Account with none is left out), the trading Accounts replaced by `trading_override` (the journal's
+    Net Balance in baht) when given. Total Portfolio Value is summed here like everywhere else. Flows of a month still running are
+    only partly entered, so no return after flows or trading P&L is stated for it; the change in value (deposits counted) is."""
+    row = {"month": month, "investment": 0.0, "trading": 0.0, "wealth": 0.0, "total": 0.0, "net_flow": net_flow, "trading_flow": 0.0,
+           "stale": [], "by_account": [], "flows_known": False, "live": True}
+    entries = [(a["id"], a["name"], a["bucket"], group_of(a), values[a["id"]]) for a in accounts
+               if a["counts_in_total"] and values.get(a["id"]) is not None]
+    if trading_override is not None:
+        entries = [e for e in entries if e[2] != "trading"] + [(None, "Trading Portfolio (journal)", "trading", "trading", trading_override)]
+    for acc_id, name, bucket, group, value in entries:
+        row[bucket] += value
+        row["total"] += value
+        row["by_account"].append({"account_id": acc_id, "account": name, "bucket": bucket, "group": group,
+                                  "value_thb": _r(value), "as_of": None, "stale": False})
+    row["growth_thb"] = row["total"] - prev["total"] if prev else None
+    row["growth_pct"] = row["growth_thb"] / prev["total"] if prev and prev["total"] else None
+    row["return_thb"] = row["return_pct"] = row["trading_pnl"] = row["trading_pnl_pct"] = None
+    for k in ("investment", "trading", "wealth", "total", "net_flow", "growth_thb"):
+        row[k] = _r(row[k])
+    return row
+
+
 def kpis(rows, shop_months):
     """Home tiles: the latest month against the month before it."""
     if not rows:
@@ -330,6 +354,16 @@ def journal_stats(conn, start, year=None, start_date=None):
              "ytd_amount": _r(net - ytd_open), "ytd_pct": net / ytd_open - 1 if ytd_open else None,
              "cagr": (net / start) ** (365.25 / days) - 1 if start and days >= 90 else None,
              "cagr_months": round(days / 30.44) if days >= 90 else None, "cagr_since": first_day[:7]}
+    # Max Drawdown: the worst fall from the running peak of the journal balance (trade by trade, peak carried across
+    # months) inside the month; `mdd_prev` is the same for the month before, so the tile can show the change.
+    bal, peak, mdd = start, start, {}
+    for t in trades:
+        bal += t["pnl"]
+        peak = max(peak, bal)
+        m = t["traded_on"][:7]
+        mdd[m] = min(mdd.get(m, 0.0), bal / peak - 1 if peak else 0.0)
+    stats["mdd"] = mdd.get(last, 0.0)
+    stats["mdd_prev"] = mdd.get(prev_month, 0.0)
     levels = {}
     for b in conn.execute("SELECT as_of, value FROM benchmarks WHERE name='BTC' ORDER BY as_of"):
         levels[b["as_of"][:7]] = b["value"]
